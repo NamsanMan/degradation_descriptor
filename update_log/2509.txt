@@ -1,0 +1,65 @@
+v250901
+colab이용을 위한 git push 및 연동
+**핵심 포인트는 하드코딩된 경로를 config.py에서 수정
+기존의 train_transformers.py의 로그 저장 방법도 train_kd.py와 동일하게 깔끔하게 하나의 .csv파일로 저장하게 설정함
+원래있던 best val miou마다 class별 iou와 confusion metrix는 주석처리
+모든 train 코드의 체크포인트(.pth)파일에 optimizer와 scheduler정보를 저장하는 코드를 추가함
+
+v250902
+config.py에 하드 코딩된 경로 2개 (BASE, DATA 경로)를 colab과 local경로별로 상황따라서 구별하여 실행하게 설정함
+KD engine의 모듈화 및 기존 segmentation model을 효과적으로 이용하기 위해 많은 곳을 수정함
+1. models 패키지에서 segformer 계열은 하나의 모듈로 관리하게 수정 >> segformer_wrapper.py이용 >> KD 사용시 feature map 반환 편하게 하도록 코드 추가 및 수정
+2. kd_engines 패키지에서 여러 KD 방법을 효율적으로 하기 위해 전반적인 수정을 거침 >> 모든 KD 방법은 앞으로 __init__.py와 base_engine.py를 거침
+3. 기존 basic_kd.py에서 segformer끼리 KD할때, hidden stage의 channel수가 맞지 않는 경우(ex. MiT B5 -> MiT B0)를 대비해서 필요에 따라 projection사용 가능하게 코드를 추가함
+
+v250904
+받은 kd_losses 패키지를 이용가능하게 kd_engines/kd_losses.py를 추가하고, models/d3p.py를 feature distillation을 위해서 수정함
+
+v250908
+DDRnet23slim 모델을 models패키지에 추가함
+앞으로 training은 200 epoch로 돌리자
+저번주에 억지로 개조한 d3p mv2는 노션 백업 코드 이용해서 복원해야죔
+
+v250910
+segformer b5 200 epoch 돌린거 성능 망가진것 보고 다리 100epoch로 롤백함
+d3p 코드 커스텀하기 전으로 롤백함
+
+v250911
+models/d3p.py를 featuremap, logit 반환하게 래퍼를 추가하여 수정함 문제없이 잘 돌아가는 것을 확인
+kd_engines/transtocnn.py를 1차적으로 완성함 >> segformer에서 d3p로 KD하는 코드
+
+v250912
+models/d3p.py에서 368*480같이 16의 배수를 받아야지만 돌아가는데 teacher인 segformer b5가 360*480으로 checkpoint 만들어놓고 368*480으로 돌리면 성능이 2프로 가까이 떨어져 d3p쪽을 수정
+>>d3p에서 해상도 문제가 발생하면 내부적으로 모델에 들어가기 전에 padding을 하고 추후 crop을 하게끔 d3p.py코드를 수정
+또한 사용하는 모든 main.py에서 checkpoint 사용여부(이 시점에서는 훈련을 진행할지 말지의 여부)를 config의 TRAIN에서 USE_CHEKCPOINT로 제어하게 조건문 추가
+
+v250916
+heterogeneous KD의 SOTA 중 하나인 PCA및 GL method를 추가함
+복잡해지고 다양해지는 KD method를 위해 train_kd.py에서 처음에 dry run 실행하여 training에 필요한 loss의 index를 자동으로 찾아서 반환하게 설정함
+
+v250919
+KD시에는 스케쥴러 RoP 별로 안좋은 것 같아서 CosineAnnealingLR로 바꿈
+HR teacher와 LW student KD 실험 시작해보려고 함
+
+v250924
+알수없는 index 오류로 KD는 물론 standalone model도 갑자기 training이 안되는 문제발생
+>>일단 dataloader단에서 train augmentation은 사용안하기로 함
+>>일단 stand alone model들은 다시 정상적으로 훈련되는것으로 보임
+>>성능이 하락했지만 어쩔수없이 사용하기로 해야될듯
+ignore index를 kd에서 어떻게 처리하는지 자세하게분석해봐야됨
+
+v250926
+일단 index에러나는건 벙확한 요인 못찾겠어서 dataloader랑 evaluate에 인덱스 튀는거 가드해놓음
+>>오류는 사라지긴함
+!!!!!!제일 큰 변경점!!!!!
+>>void index를 아예 빼서 총 class개수는 11개, label에 void index 11이 나오면 걍 무시하기로 설정
+>>>train및 KD에서 혼동되지 않게끔 하기 위해
+>>>즉, 기존 class 개수가 12개에서 11개로 줄었다
+>>>이는 결과물 파일 마지막에 "new"로 명시하면서 나타내기로 함
+>>evaluate.py 수정
+d3p.py의 encoder stage 설정하는거 mobilenetV2가 stage5개라서 (1,2,3,4)에서 (1,2,3,4,5)로 수정함
+>>"0"은 smp의 encoder에서는 encoder의 stage가 아닌 input에 해당하기 때문에 0은 제외시켜놓음
+나중에 stage별 선택이 필요할때, config.py의 KD부분에 잘 적어 놓았으니 혼동하지 말것
+CAKD를 위해 main_CAKD.py와 train_CAKD.py를 생성했는데 아무래도 정보가 부족해서 이상하게 돌아가는것 같아 CAKD는 포기
+unet 사용을 위해 추가함
+>>앞으로 쓸일 없을것 같긴 함

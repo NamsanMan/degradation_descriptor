@@ -1,0 +1,89 @@
+##########################################################
+# 오프라인 학습 기반입니다
+##########################################################
+
+v250710
+resnet 50의 fcn기반으로 training 및 segmentation 진행완료
+결과 pth파일은 걍 지웠음
+test 진행한 결과 이미지는 E:\LAB\result_files\test_results\1 경로에 있다
+
+v250711
+학습시 5에포크마다 plt로 train loss, valid loss, mIoU 그래프 그려서 저장하게 함
+resnet 50 fcn 없애고 github에서 unet 다운받아서 training 돌리는중
+UNet을 백본으로 쓰실 때는 FCN-style의 model(imgs)['out'] 대신에 그대로 model(imgs) 이 Logits Tensor를 리턴한다는 점만 고려해서 수정함
+'out' 인덱싱을 모두 제거함
+Unet은 d3p보다 빠르고 resnet50기반 fcn보다는 느림
+restnet50 성능 별로 >> 저장된것 확인
+d3p는 진짜 개느렸음
+이식 성공한것 같은데 30 epoch 돌리고 확인해봐야됨
+
+
+v250714
+model의 pretrained load 유무 조정(기존 실험 다시 할 예정)
+test set 나누고 data_loader 다시 구성
+test set에 대한 mIoU는 학습이 완료된 후 한번 평가
+
+v250715
+segmentation_models_pytorch 를 이용
+여러가지 모델 test 진행중인데 deeplabv3 plus의 특성상 input을 16의 배수 크기로 받아야돼서 (360, 480)을 >> (368, 480)으로 수정
+main.py에 test 결과를 txt파일로 저장하게 설정(45번째 줄) >> 다음 실험부터 적용되니 확인해보기
+
+v250716
+예측 결과 이미지를 (original, ground truth, prediction)이렇게 해서 5세트를 만들어내게 함 >> main.py 수정
+
+v250717
+1fold dataset가지고 validation진행(데이터 양을 늘린다)
+data augmentation(training) 추가
+optimizer를 SGD에서 AdamW로 변경 >> Real-Time Semantic Segmentation: A Brief Survey & Comparative Study in Remote Sensing 참조함
+pixel accuracy 지표 추가
+
+v250718
+!!!mIoU나 mean pixel accuracy계산시에 void class가 들어갔던것을 해결!!!
+class별 IoU계산하여 저장하게 설정
+best valid miou기반으로 best model 선정하여 test 진행하도록 수정
+pathlib import Path로 경로 컨트롤 쉽게 하게 함
+
+v250721
+CamVid12 dataset은 모든실험에서 앞으로는 받은 A, B set으로 2fold val하게 설정
+받은 논문과 동일한 augmentation 환경 설정(crop, rotation, color jitter) 추가
+
+v250722
+adam으로 optimizer변경(논문 코드와의 검정을 위해)
+
+v2507223
+scheduler를 stepLR에서 polyLR로 변경 >> train.py
+받은 코드와 유사하게 해보려고 맞춰봄
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-9)
+scheduler = PolyLRScheduler(
+    optimizer,
+    t_initial=100,      # 총 epoch 수
+    power=0.9,          # 다항식 지수
+    t_in_epochs=True    # epoch 단위로 스텝 계산 (기본값)
+)
+
+v250724 ******코드 크게 수정함 >> main.py 및 train.py
+train 돌린 hyperparameter(optimizer, scheduler 포함)를 메모장에 기록하도록 train.py 수정
+miou계산식과(배치 전체에 대해서 계산), 클래스별 iou계산방식(데이터하나에 대한, 논문에서 쓰는 국룰 평가지수)계산 방식이 일치하지 않아 train.py를 전체적으로 수정함
+train.py에 confusion matrix를 계산하는 코드를 추가함
+!!! output featuremap 시각화 할때 rgb이미지 클래스별로 올바르게 출력하게 해야됨 >> main.py에 추가함
+
+v250725
+인수인계 받은 code_subcom에서 "DLCs"가져옴 >> SR network나 semantic segmentation network등이 포함됨
+train.py의 write_summary에 모델 구조의 파라미터수와 FLOPs 기록하게 함
+
+v250728
+주말동안 d3p xception을 돌렸는데 결과 별로 안좋았었음 >> 100 epoch 했었는데 loss graph보니까 epoch 최소 두배로 늘려봐야할듯
+
+v250729
+transformer이용해보려고 "pip install transformers"했고
+train_tranformers.py와 main_transformers.py라는걸로 따로 분리해서 만들어봄.
+기존 D3P의 입력size인 (368, 480)를 받기 위해 main.py, train.py, data_loader.py부분을 고쳤는데, 다시 (360, 480)으로 만들어주기 위해 data_loader.py하고 main_transformers.py, train_transformers.py만 수정함
+퇴근전에 scheduler polyLR로 바꾸고 실험 돌려놓고 퇴근함. optimizer의 LR도 원래1e-4에서 5e-5로 바꿔놓고 퇴근함
+
+v250730
+어제 돌려놓고 간거 epoch를 더 늘려야될 것 같아서 200으로 늘려서 training 진행함
+>> 성능ReduceLROnPlateau보다 살짝 더 높지만(2%오름, 0.70 -> 0.72) 200epoch이라서 학습이 너무 오래 걸려 일단 다시 원복함(optimizer LR=1e-4, ReduceLROnPlateau)
+segformer b0 -> b3로 바꾸고 dataloader의batchsize 1로 줄여서 작업관리자 보면서 안정성 check하고 점검할거임
+>> 안정적이라면 batchsize 조금씩 증가시킬 예정
+>>> 꽉꽉 채워서 batch_size = 4로 설정함
+

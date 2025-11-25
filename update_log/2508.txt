@@ -1,0 +1,104 @@
+v250801
+segformer b3는 무겁기때문에 dataloader에서 batch size를 8에서 4로 줄이고 b3 돌려봄 >> Aset, Bset 전부 0.76정도 나옴
+>>criterion = nn.CrossEntropyLoss(ignore_index=11)
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=5,
+    min_lr=1e-6
+)
+train_loader = DataLoader(train_dataset, batch_size=4,  shuffle=True,  num_workers=0)
+저번주에 실험하고 보고했던 d3p resnet50을 요번주 초에 동일조건으로 다시 돌려봤는데 계속 2~3프로정도 성능이 낮게 나와서 원인을 찾다가 오늘 아침 동일 조건에서 다시 돌려보니까 원래 성능과 동일 혹은 이상으로 성능이 좋게 나오는걸 확인
+>>batch size를 4로 줄인것 밖에 없음
+>>criterion = nn.CrossEntropyLoss(ignore_index=11)
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=10,
+    min_lr=1e-6
+)
+train_loader = DataLoader(train_dataset, batch_size=4,  shuffle=True,  num_workers=0)
+batchsize도 log의 메모장에 기록되게 train.py랑 train_transformers.py에 추가함
+**batchsize 4로 유지하고 scheduler을 ployLR로 바꾸고 epoch 200으로 늘리고 시작 lr=5e-5로 하면 segformer b0도 성능 훨씬 더 늘것 같음
+**대체적으로 polyLR로 바꾸고 epoch를 최소 두배 이상 늘리면 성능이 늘어나는것 같음(근거: segformer b0로 테스트 돌린것)
+
+퇴근하기 전에 train_transformer.py에 segformer_source를 추가해 효율적으로 segformer 소스관리를 하고 메모장에 뭐 썼는지 기록도 하게 해 놓음 >> 아직 실행은 안시켜봄 >> 됨
+입력 해상도 매번 368, 360 바꿔주기 귀찮아서 data_loader.py에 input_resolution 만들어놓고 모든 코드에서 이를 불러와 사용하게 해 놓은 >> 아직 실행 안해봄 >> 됨
+
+v250805
+드디어 제대로된 segformer 비교군 찾아서 training중임
+현재 바꾼/추가된 설정
+>>augemntation은 논문이랑 거의 일치시킴
+>>scheduler를 cosine annealing으로 변경
+>>adamW에 momentum 0.9추가후 WD=1e-4에서 1e-2로 변경
+>>training과 validation에 이미지크기를 224*224로 resize
+>>batchsize 16으로 바꾸고 epoch도 200으로 늘림
+>>제일 중요한건 segformer B3의 pretrained 끄고 from scrach부터 학습한다
+>>네트워크 weight초기화 방식을 따로 지정해둠(비교논문이랑 동일하게 -> pretrain 안쓸때만 사용)
+
+v250806
+어제 바꿨던 설정들 전부 원복함
+adamW의 WD=1e-4 >> WD=1e-2로 변경
+
+v250807
+train_transformers.py에 warmup 기능 추가
+
+v250808
+GPT 5 나온걸로 디버깅 한번 돌려봄
+train_transformer.py에서 다음과 같은 사항들을 수정함
+1. ptflops를 cpu 복사본으로 계싼하게 함 -> ptflops가 기본적으로 cpu 텐서를 이용해서 더미 입력을 만들기 때문
+2. checkpoint를 중복저장하게 하는 코드 제거 (torch.save)
+data_loader.py에서 random 크롭을 개선
+
+v250811
+기존의 train_transformer.py 코드에서 FLOPs수가 비정상적으로 계산되는것을 확인 >> 기존의 ptflops에서는 conv/linear기반의 계산만 count하므로 transformer의 계산들이 집계가 안된다는 점을 발견하여 수정함
+
+v250812
+추론 과정의 fps측정하는 measure_modelonly_fps.py를 만들어놓음
+training에 training시간을 기록하는 코드 추가
+
+v250814
+training과정에서 걸리는 시간을 구체적으로 비교하기 위해서 profile_training_step.py를 만듦
+출력 로그 중 model을 불러오는 trainer 기반 코드를 이용할 때 "Unsupported operator aten:"로그가 뜨는 원인을 찾음
+>>fvcore를 FLOPs를 측정하기 위해 이용하는데, 여기서 해당 연산자들을 지원하지 않아서 계산에 skip한 것으로, 정확한 FLOPs가 출력되지 않고 실제보다 작게 출력됨(아마 parameter도 그럴것 같은데????)
+노이즈가 들어간 LR이미지 일단 segformer B1으로 A, B set 돌려 보는중
+*torch summary이용해보기
+
+v250815
+measure코드에 torcinfo로 모델별 parameter과 FLOPs를 제대로 측정하는 코드를 추가 >> 추루 본 코드와 최적화 필요
+
+v250818
+코드 대수술
+코드 대수술
+코드 대수술
+코드 대수술
+코드 대수술
+코드 대수술
+각종 모듈 분리하여 세분화, 속도를 위한 최적화 및 실험환경 조절의 편리화
+parameter과 FLOPs세는거는 아예 따로 분리함 >> main_transformers.py만 실행시키면 작동하지 않는다
+시드 고정 추가 >> main쪽에
+
+v250819
+models 패키지를 따로 만들어서 모델을 따로 저장해 놓음
+
+v250825
+KD를 위한 준비
+config.py에 KD를 위한 옵션들 추가
+models의 segformerb1.py와 segformerb3.py에 KD이용시 중간 feature값까지 같이 꺼내게하는 옵션 추가(원래는 logit값만 반환하게 했었음)
+kd폴더 만들어서 online_kd.py로 kd 하게 한다
+kd를 이용하기 위해 수정된 train_kd.py와 main_kd.py 추가
+
+v250828
+train_kd.py에 매 epoch마다 csv파일에 해당 epoch의 total loss, student의 cross entropy, kd의 logit loss, kd의 feature loss, val_miou, pixel accuracy, class별 iou가 저장되며 하나의 파일로 갱신되게 코드를 수정
+train_kd.py에 confusion metrix 저장 코드 삭제
+main_kd.py에 seed고정이 random한 이미지 시각화에도 영향을 미쳐, 시각화에는 seed고정을 안하기로 함
+
+v250829
+train_kd.py의 run_training에서 basic_kd.py호출시 nn.Module.train()에 의해 teacher모델을 freeze해도 다시 이상하게 train()모드가 자동으로 전환되는 치명적인 버그를 수정
+KD하이퍼 파라미터값이 이상하다 해서 수정(GPT 추천 수치로)
+csv log 파일에 epoch별 LR을 기록하는 코드 추가
+train_kd.py의 write_summary에 KD의 각종 정보 추가로 기록하게 설정

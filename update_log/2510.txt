@@ -1,0 +1,14 @@
+v251004
+config.py의 class에 다시 void넣고 수정함(롤백함)
+
+v251020
+다시 index 오류나서 이것저것 안정장치 하고 다시 class수를 11로 수정함. GPT나 Gemini가 바꾸라함.
+명확하게 오류가 해결되었는지는 계속 돌리면서 확인해봐야할듯
+###앞으로 새로운 컴퓨터 rtx5060ti 환경에서 돌림###
+
+v251023
+생각중인 proposed method중 하나인 "Patchwise Degradation Mix(PDM)"를 data_loader.py에 augmentation 형식으로 추가함
+GCKD도 추가해봄
+
+v251024
+별도의 프로젝트로 관리해야될것 같아서 따로 뺌
