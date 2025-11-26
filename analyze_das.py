@@ -13,7 +13,7 @@ from models import create_model
 # 사용자 설정
 # ==========================================
 # 학습이 완료된 체크포인트 경로 (수정 필수)
-CHECKPOINT_PATH = Path(r"D:\LAB\result_files\test_results\Bset_LR_d3presnet50_SWTdescriptor_FiLM\best_model.pth")
+CHECKPOINT_PATH = Path(r"D:\LAB\result_files\test_results\Aset_LR_d3presnet50_SWTdescriptor_FiLM_regularization\best_model.pth")
 
 # 분석할 배치의 수
 NUM_BATCHES = 20

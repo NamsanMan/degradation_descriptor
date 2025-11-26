@@ -24,7 +24,7 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
@@ -35,7 +35,7 @@ else:
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Bset_LR_d3presnet50_SWTdescriptor_FiLM_regularization"
+    PROJECT_NAME = "Aset_LR_d3presnet50_SWTdescriptor_conv_3try"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -143,7 +143,7 @@ class MODEL:
 
     # === [NEW] Descriptor 설정 추가 ===
     USE_DESCRIPTOR = True  # DAS 모듈 사용 여부
-    DESCRIPTOR_PATH = Path(r"D:\LAB\result_files\des_SWT_module_Bset\descriptor_net.pth")  # 학습된 Descriptor 경로
+    DESCRIPTOR_PATH = Path(r"D:\LAB\result_files\des_SWT_module_Aset\descriptor_net.pth")  # 학습된 Descriptor 경로
 
 # ──────────────────────────────────────────────────────────────────
 # 4. TRAIN: 훈련 과정 관련 설정

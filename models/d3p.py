@@ -1,4 +1,4 @@
-# d3p.py (Final Optimized & Generalized with Score Normalization)
+# d3p.py (Dynamic Convolution Version)
 from typing import List, Sequence, Tuple, Union
 import math
 import torch
@@ -7,9 +7,7 @@ import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 
 # Descriptor V3 (SWT)
-# descriptor_v3.py가 프로젝트 루트에 있어야 합니다.
 from descriptor_v3 import DegradationDescriptorNet
-
 from config import DATA, MODEL
 
 DEFAULT_ENCODER_NAME = "resnet50"
@@ -23,45 +21,80 @@ PAD_MODE = "replicate"
 
 
 # ==========================================
-# DAS Block: Soft Gating (Safety-First)
+# [NEW] Dynamic Convolution DAS Block
 # ==========================================
-class DASBlock(nn.Module):
+class DynamicDASBlock(nn.Module):
     """
-    Model-Agnostic Feature Modulator
+    Descriptor 점수에 따라 Conv Weight를 동적으로 생성하는 레이어 (CondConv)
+    - FiLM(값 조절) 대신 필터(Weight) 자체를 바꿔서 근본적인 대응 수행.
+    - 예: 노이즈가 심하면 Smoothing 필터, 블러가 심하면 Sharpening 필터 자동 합성.
     """
 
-    def __init__(self, in_channels: int, descriptor_dim: int = 3):
+    def __init__(self, in_channels: int, descriptor_dim: int = 3, num_experts: int = 3):
         super().__init__()
         self.in_channels = in_channels
+        self.num_experts = num_experts  # 전문가 개수 (예: Clean용, Noise용, Blur용)
 
-        self.mlp = nn.Sequential(
-            nn.Linear(descriptor_dim, in_channels),
+        # 1. Routing Function (Descriptor -> Expert Weights)
+        self.routing_fc = nn.Sequential(
+            nn.Linear(descriptor_dim, 16),
             nn.ReLU(inplace=True),
-            nn.Linear(in_channels, in_channels * 2),
+            nn.Linear(16, num_experts),
+            nn.Softmax(dim=1)  # 확률값 (합이 1)
         )
 
-        # [Initialization]
-        # 학습 초기에는 Identity(Scale=1, Shift=0)에 가깝게 동작하도록
-        # weight를 0 근처로 초기화함 (약간 키워서 반응성 확보)
-        with torch.no_grad():
-            self.mlp[-1].weight.data.normal_(mean=0.0, std=0.01)  # 0.001 -> 0.01
-            self.mlp[-1].bias.data.fill_(0.0)
+        # 2. Expert Weights (Static Kernels)
+        # 1x1 Conv를 사용하여 채널 간의 관계를 동적으로 재설정
+        # Shape: [num_experts, in_channels, in_channels, 1, 1]
+        # 주의: 파라미터 수가 너무 커지지 않게 1x1 Conv 사용 권장
+        self.weight = nn.Parameter(
+            torch.Tensor(num_experts, in_channels, in_channels, 1, 1)
+        )
+
+        # Initialization
+        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        params = self.mlp(scores)
-        gamma_raw, beta_raw = torch.split(params, self.in_channels, dim=1)
+        """
+        x: [B, C, H, W]
+        scores: [B, 3]
+        """
+        B, C, H, W = x.shape
 
-        gamma_raw = gamma_raw.view(-1, self.in_channels, 1, 1)
-        beta_raw = beta_raw.view(-1, self.in_channels, 1, 1)
+        # 1. Routing Weights 계산
+        # routing_w: [B, num_experts]
+        routing_w = self.routing_fc(scores)
 
-        # Soft Gating Range
-        ALPHA = 0.3  # 0.2 -> 0.3 (반응성 확대)
-        BETA_LIMIT = 0.5
+        # 2. Dynamic Kernel 합성
+        # weights: [B, C_out, C_in, 1, 1]
+        # (B, K) x (K, C, C, 1, 1) -> (B, C, C, 1, 1)
+        # einsum을 쓰면 깔끔하지만, 직관적인 구현을 위해 reshape 사용
 
-        gamma = 1.0 + ALPHA * torch.tanh(gamma_raw)
-        beta = BETA_LIMIT * torch.tanh(beta_raw)
+        # [B, K, 1, 1, 1, 1] * [1, K, C, C, 1, 1] -> Sum over K
+        routing_w = routing_w.view(B, self.num_experts, 1, 1, 1, 1)
+        expert_weights = self.weight.unsqueeze(0)
 
-        return x * gamma + beta
+        # 배치별 동적 커널 생성
+        dynamic_weight = (routing_w * expert_weights).sum(dim=1)  # [B, C, C, 1, 1]
+
+        # 3. Apply Conv per Sample (Efficient Group Conv)
+        # Pytorch는 배치별 커널 적용을 직접 지원하지 않으므로 Group Conv 트릭 사용
+
+        # Input을 [1, B*C, H, W]로 변형
+        x_grouped = x.view(1, B * C, H, W)
+
+        # Weight를 [B*C, C, 1, 1]로 변형 (Group=B)
+        # Conv2d의 weight shape는 [Out, In/Groups, k, k]
+        w_grouped = dynamic_weight.view(B * C, C, 1, 1)
+
+        # Group Conv 수행 (각 샘플이 자신의 커널로 컨볼루션됨)
+        out = F.conv2d(x_grouped, w_grouped, stride=1, padding=0, groups=B)
+
+        # 원래 형태로 복구
+        out = out.view(B, C, H, W)
+
+        # Residual Connection (안전장치)
+        return x + out
 
 
 class DeepLabV3PlusWrapper(nn.Module):
@@ -84,14 +117,11 @@ class DeepLabV3PlusWrapper(nn.Module):
         # === DAS Module Setup ===
         self.use_das = use_das
         if self.use_das:
-            print(f"▶ [d3p] Enabling DAS Mode (General: All Stages + Score Norm)")
+            print(f"▶ [d3p] Enabling DAS Mode (Dynamic Convolution Version)")
             if descriptor_path is None:
                 raise ValueError("descriptor_path must be provided when use_das=True")
 
-            # 1. Load Descriptor (V3 SWT)
             self.descriptor = DegradationDescriptorNet(in_channels=3, num_bands=3)
-
-            # Load weights
             try:
                 ckpt = torch.load(descriptor_path, map_location='cpu', weights_only=False)
             except TypeError:
@@ -99,19 +129,19 @@ class DeepLabV3PlusWrapper(nn.Module):
 
             state_dict = ckpt.get("model_state", ckpt)
             self.descriptor.load_state_dict(state_dict)
-
-            # Freeze Descriptor
             self.descriptor.eval()
             for param in self.descriptor.parameters():
                 param.requires_grad = False
 
-            # 2. Create DAS Blocks for ALL Encoder Outputs
+            # Dynamic Conv는 파라미터가 많으므로 필요한 곳(2, 5)에만 적용 권장
+            # 하지만 일반화를 위해 전체 적용하되, num_experts를 작게 유지
             enc_out_ch = getattr(self.encoder, "out_channels", [])
             self.das_blocks = nn.ModuleList()
 
             for i, ch in enumerate(enc_out_ch):
                 if ch > 0:
-                    self.das_blocks.append(DASBlock(in_channels=ch, descriptor_dim=3))
+                    # [Change] DynamicDASBlock 사용
+                    self.das_blocks.append(DynamicDASBlock(in_channels=ch, descriptor_dim=3))
                 else:
                     self.das_blocks.append(nn.Identity())
         else:
@@ -145,7 +175,6 @@ class DeepLabV3PlusWrapper(nn.Module):
     def _crop_spatial(self, t: torch.Tensor, H: int, W: int) -> torch.Tensor:
         return t[..., :H, :W]
 
-    # [FIXED] forward function in DeepLabV3PlusWrapper
     def forward(
             self,
             x: torch.Tensor,
@@ -154,32 +183,21 @@ class DeepLabV3PlusWrapper(nn.Module):
 
         x_pad, (H_orig, W_orig), (pad_h, pad_w) = self._pad_to_stride(x, AUTO_PAD_STRIDE)
 
-        # 1) Descriptor Inference & Safer Normalization
+        # 1) Descriptor Inference (No Normalization Needed for Softmax)
         deg_scores = None
         if self.use_das:
             with torch.no_grad():
-                raw_scores = self.descriptor(x_pad)  # [B, 3], Range: 0~1
-
-                # [CRITICAL FIX]
-                # Z-score 정규화는 배치 내 분산이 0일 때 Gradient 폭발 위험이 있음.
-                # 대신 0.5를 중심으로 단순 Shift만 수행하거나, Min-Max 스케일링을 사용.
-
-                # 전략: Centering only (안전함)
-                # 0~1 범위를 -1~1 범위로 매핑하여 MLP가 양수/음수를 모두 보게 함.
-                deg_scores = (raw_scores - 0.5) * 2.0
-
-                # 만약 분산을 키우고 싶다면 상수를 곱하되, 나눗셈은 피함.
-                # deg_scores = deg_scores * 2.0 # (선택사항: 민감도 2배 증가)
+                deg_scores = self.descriptor(x_pad)  # [B, 3]
 
         # 2) Encoder Forward
         features: List[torch.Tensor] = self.encoder(x_pad)
 
-        # 3) Feature Modulation
+        # 3) Dynamic Feature Modulation
         if self.use_das and deg_scores is not None:
             new_features = []
             for i, feat in enumerate(features):
                 if i < len(self.das_blocks):
-                    # 안전한 deg_scores가 들어감
+                    # Dynamic Conv 실행
                     feat = self.das_blocks[i](feat, deg_scores)
                 new_features.append(feat)
             features = new_features

@@ -16,7 +16,7 @@ from descriptor_v3 import FrequencyDegradationTarget  # GT 생성용 (옵션)
 # ==========================================
 # 설정
 # ==========================================
-CHECKPOINT_PATH = Path(r"D:\LAB\result_files\test_results\Aset_LR_d3presnet50_SWTdescriptor_FiLM\best_model.pth")
+CHECKPOINT_PATH = Path(r"D:\LAB\result_files\test_results\Aset_LR_d3presnet50_SWTdescriptor_FiLM_regularization\best_model.pth")
 OUTPUT_DIR = CHECKPOINT_PATH.parent / "impact_analysis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
