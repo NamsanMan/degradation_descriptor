@@ -1,4 +1,4 @@
-# d3p.py (Dynamic Convolution Version)
+# d3p.py (with SWT Frequency Attention)
 from typing import List, Sequence, Tuple, Union
 import math
 import torch
@@ -6,105 +6,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 import segmentation_models_pytorch as smp
 
-# Descriptor V3 (SWT)
-from descriptor_v3 import DegradationDescriptorNet
-from config import DATA, MODEL
+from models.swt_attention import SWTFrequencyAttention  # ← SWT 모듈
+from config import DATA
 
-DEFAULT_ENCODER_NAME = "resnet50"
-DEFAULT_ENCODER_WEIGHTS = "imagenet"
-DEFAULT_IN_CHANNELS = 3
-DEFAULT_NUM_CLASSES = DATA.NUM_CLASSES
+DEFAULT_ENCODER_NAME     = "resnet50"
+DEFAULT_ENCODER_WEIGHTS  = "imagenet"
+DEFAULT_IN_CHANNELS      = 3
+DEFAULT_NUM_CLASSES      = DATA.NUM_CLASSES
+
+# 주의: smp encoder.features() 의 index 범위에 맞게 사용
+#  - 일반적으로 0~4 (5개 stage)
+#  - stage_indices 안에 잘못된 index가 있어도 아래 코드에서 자동으로 skip되도록 수정함.
 DEFAULT_STAGE_INDICES: Tuple[int, ...] = (0, 1, 2, 3, 4)
 
-AUTO_PAD_STRIDE = 16
-PAD_MODE = "replicate"
-
-
-# ==========================================
-# [NEW] Dynamic Convolution DAS Block
-# ==========================================
-class DynamicDASBlock(nn.Module):
-    """
-    Descriptor 점수에 따라 Conv Weight를 동적으로 생성하는 레이어 (CondConv)
-    - FiLM(값 조절) 대신 필터(Weight) 자체를 바꿔서 근본적인 대응 수행.
-    - 예: 노이즈가 심하면 Smoothing 필터, 블러가 심하면 Sharpening 필터 자동 합성.
-    """
-
-    def __init__(self, in_channels: int, descriptor_dim: int = 3, num_experts: int = 3):
-        super().__init__()
-        self.in_channels = in_channels
-        self.num_experts = num_experts  # 전문가 개수 (예: Clean용, Noise용, Blur용)
-
-        # 1. Routing Function (Descriptor -> Expert Weights)
-        self.routing_fc = nn.Sequential(
-            nn.Linear(descriptor_dim, 16),
-            nn.ReLU(inplace=True),
-            nn.Linear(16, num_experts),
-            nn.Softmax(dim=1)  # 확률값 (합이 1)
-        )
-
-        # 2. Expert Weights (Static Kernels)
-        # 1x1 Conv를 사용하여 채널 간의 관계를 동적으로 재설정
-        # Shape: [num_experts, in_channels, in_channels, 1, 1]
-        # 주의: 파라미터 수가 너무 커지지 않게 1x1 Conv 사용 권장
-        self.weight = nn.Parameter(
-            torch.Tensor(num_experts, in_channels, in_channels, 1, 1)
-        )
-
-        # Initialization
-        nn.init.kaiming_normal_(self.weight, mode='fan_out', nonlinearity='relu')
-
-    def forward(self, x: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B, C, H, W]
-        scores: [B, 3]
-        """
-        B, C, H, W = x.shape
-
-        # 1. Routing Weights 계산
-        # routing_w: [B, num_experts]
-        routing_w = self.routing_fc(scores)
-
-        # 2. Dynamic Kernel 합성
-        # weights: [B, C_out, C_in, 1, 1]
-        # (B, K) x (K, C, C, 1, 1) -> (B, C, C, 1, 1)
-        # einsum을 쓰면 깔끔하지만, 직관적인 구현을 위해 reshape 사용
-
-        # [B, K, 1, 1, 1, 1] * [1, K, C, C, 1, 1] -> Sum over K
-        routing_w = routing_w.view(B, self.num_experts, 1, 1, 1, 1)
-        expert_weights = self.weight.unsqueeze(0)
-
-        # 배치별 동적 커널 생성
-        dynamic_weight = (routing_w * expert_weights).sum(dim=1)  # [B, C, C, 1, 1]
-
-        # 3. Apply Conv per Sample (Efficient Group Conv)
-        # Pytorch는 배치별 커널 적용을 직접 지원하지 않으므로 Group Conv 트릭 사용
-
-        # Input을 [1, B*C, H, W]로 변형
-        x_grouped = x.view(1, B * C, H, W)
-
-        # Weight를 [B*C, C, 1, 1]로 변형 (Group=B)
-        # Conv2d의 weight shape는 [Out, In/Groups, k, k]
-        w_grouped = dynamic_weight.view(B * C, C, 1, 1)
-
-        # Group Conv 수행 (각 샘플이 자신의 커널로 컨볼루션됨)
-        out = F.conv2d(x_grouped, w_grouped, stride=1, padding=0, groups=B)
-
-        # 원래 형태로 복구
-        out = out.view(B, C, H, W)
-
-        # Residual Connection (안전장치)
-        return x + out
+# 내부 패딩 설정
+AUTO_PAD_STRIDE = 16          # DeepLabV3+ 기본 output stride = 16
+PAD_MODE = "replicate"        # 'replicate' or 'reflect' 권장
 
 
 class DeepLabV3PlusWrapper(nn.Module):
     def __init__(
-            self,
-            base_model: smp.DeepLabV3Plus,
-            stage_indices: Sequence[int] = DEFAULT_STAGE_INDICES,
-            num_classes: int = DEFAULT_NUM_CLASSES,
-            use_das: bool = False,
-            descriptor_path: str = None
+        self,
+        base_model: smp.DeepLabV3Plus,
+        stage_indices: Sequence[int] = DEFAULT_STAGE_INDICES,
+        num_classes: int = DEFAULT_NUM_CLASSES,
+        use_swt: bool = False,              # ← SWT 사용 여부 (기본 False, 실험 시 True)
+        swt_stage_idx: int = 2,             # ← SWT를 적용할 encoder stage index
     ) -> None:
         super().__init__()
         self.encoder = base_model.encoder
@@ -114,41 +41,7 @@ class DeepLabV3PlusWrapper(nn.Module):
         self.stage_indices: Tuple[int, ...] = tuple(stage_indices)
         self.num_classes = int(num_classes)
 
-        # === DAS Module Setup ===
-        self.use_das = use_das
-        if self.use_das:
-            print(f"▶ [d3p] Enabling DAS Mode (Dynamic Convolution Version)")
-            if descriptor_path is None:
-                raise ValueError("descriptor_path must be provided when use_das=True")
-
-            self.descriptor = DegradationDescriptorNet(in_channels=3, num_bands=3)
-            try:
-                ckpt = torch.load(descriptor_path, map_location='cpu', weights_only=False)
-            except TypeError:
-                ckpt = torch.load(descriptor_path, map_location='cpu')
-
-            state_dict = ckpt.get("model_state", ckpt)
-            self.descriptor.load_state_dict(state_dict)
-            self.descriptor.eval()
-            for param in self.descriptor.parameters():
-                param.requires_grad = False
-
-            # Dynamic Conv는 파라미터가 많으므로 필요한 곳(2, 5)에만 적용 권장
-            # 하지만 일반화를 위해 전체 적용하되, num_experts를 작게 유지
-            enc_out_ch = getattr(self.encoder, "out_channels", [])
-            self.das_blocks = nn.ModuleList()
-
-            for i, ch in enumerate(enc_out_ch):
-                if ch > 0:
-                    # [Change] DynamicDASBlock 사용
-                    self.das_blocks.append(DynamicDASBlock(in_channels=ch, descriptor_dim=3))
-                else:
-                    self.das_blocks.append(nn.Identity())
-        else:
-            self.descriptor = None
-            self.das_blocks = None
-
-        # Property setup
+        # encoder 출력 채널 정보
         enc_out_ch = getattr(self.encoder, "out_channels", None)
         if isinstance(enc_out_ch, (list, tuple)):
             self._feat_channels = [
@@ -156,6 +49,25 @@ class DeepLabV3PlusWrapper(nn.Module):
             ]
         else:
             self._feat_channels = None
+
+        # === SWT Frequency Attention 설정 ===
+        self.use_swt = bool(use_swt)
+        self.swt_attn: Union[SWTFrequencyAttention, None] = None
+        self.swt_stage_idx: int = swt_stage_idx
+
+        if self.use_swt and isinstance(enc_out_ch, (list, tuple)):
+            # stage index 보정 (범위 밖이면 마지막 stage로 보정)
+            if self.swt_stage_idx < 0 or self.swt_stage_idx >= len(enc_out_ch):
+                self.swt_stage_idx = len(enc_out_ch) - 1
+
+            swt_ch = enc_out_ch[self.swt_stage_idx]
+            self.swt_attn = SWTFrequencyAttention(
+                student_channels=swt_ch,
+                rgb_channels=3,
+                reduction_ratio=4,
+            )
+        else:
+            self.use_swt = False  # encoder 정보가 없으면 SWT 비활성화
 
     @property
     def feat_channels(self) -> Union[List[int], None]:
@@ -173,50 +85,62 @@ class DeepLabV3PlusWrapper(nn.Module):
         return x_pad, (H, W), (pad_h, pad_w)
 
     def _crop_spatial(self, t: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        # 마지막 2차원만 크롭
         return t[..., :H, :W]
 
+    def _denorm_input(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        data_loader에서 ImageNet mean/std로 정규화된 입력을
+        대략 [0,1] 스케일의 RGB로 되돌리는 helper.
+        """
+        mean = x.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std  = x.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        return x * std + mean
+
     def forward(
-            self,
-            x: torch.Tensor,
-            return_feats: bool = False,
+        self,
+        x: torch.Tensor,
+        return_feats: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]]]:
 
+        # 1) 내부에서 stride 배수로 자동 패딩
         x_pad, (H_orig, W_orig), (pad_h, pad_w) = self._pad_to_stride(x, AUTO_PAD_STRIDE)
 
-        # 1) Descriptor Inference (No Normalization Needed for Softmax)
-        deg_scores = None
-        if self.use_das:
+        # 2) SWT용 raw 이미지 준비 (de-normalize)
+        raw_for_swt = None
+        if self.use_swt and self.swt_attn is not None:
             with torch.no_grad():
-                deg_scores = self.descriptor(x_pad)  # [B, 3]
+                # [0,1] 근처로 클램핑해서 SWT에 입력
+                raw_for_swt = self._denorm_input(x_pad).clamp(0.0, 1.0)
 
-        # 2) Encoder Forward
+        # 3) encoder forward
         features: List[torch.Tensor] = self.encoder(x_pad)
 
-        # 3) Dynamic Feature Modulation
-        if self.use_das and deg_scores is not None:
-            new_features = []
-            for i, feat in enumerate(features):
-                if i < len(self.das_blocks):
-                    # Dynamic Conv 실행
-                    feat = self.das_blocks[i](feat, deg_scores)
-                new_features.append(feat)
-            features = new_features
+        # 4) SWT Attention 적용 (선택된 stage 한 곳)
+        if self.use_swt and self.swt_attn is not None and raw_for_swt is not None:
+            idx = self.swt_stage_idx
+            if 0 <= idx < len(features):
+                features[idx] = self.swt_attn(raw_for_swt, features[idx])
 
-        # 4) Decoder & Head
+        # 5) decoder & head
         dec_out: torch.Tensor = self.decoder(features)
         logits_pad: torch.Tensor = self.segmentation_head(dec_out)
 
+        # 6) logits는 원본 H×W로 크롭 (CE/KD 바로 사용 가능)
         logits = self._crop_spatial(logits_pad, H_orig, W_orig)
 
         if not return_feats:
             return logits
 
+        # 7) 스테이지 feat도 원본 공간에 대응되도록 크롭
         Hp, Wp = x_pad.shape[-2], x_pad.shape[-1]
         feats_out: List[torch.Tensor] = []
         for i in self.stage_indices:
-            if i >= len(features): continue
+            if i < 0 or i >= len(features):
+                continue  # out-of-range 방지
             f = features[i]
             fh, fw = f.shape[-2], f.shape[-1]
+            # stage stride 추정 (보통 정수: 4/8/16/32)
             sh = max(1, Hp // fh)
             sw = max(1, Wp // fw)
             Hf = math.ceil(H_orig / sh)
@@ -227,17 +151,31 @@ class DeepLabV3PlusWrapper(nn.Module):
         return logits, feats_out
 
 
-# --- Factory Functions ---
+def get_backbone_channels(
+    encoder_name: str = DEFAULT_ENCODER_NAME,
+    encoder_weights: Union[str, None] = DEFAULT_ENCODER_WEIGHTS,
+    in_channels: int = DEFAULT_IN_CHANNELS,
+    stage_indices: Sequence[int] = DEFAULT_STAGE_INDICES,
+) -> List[int]:
+    enc = smp.encoders.get_encoder(
+        encoder_name,
+        in_channels=in_channels,
+        depth=5,
+        weights=encoder_weights,
+    )
+    out_ch = getattr(enc, "out_channels", [])
+    return [out_ch[i] for i in stage_indices if 0 <= i < len(out_ch)]
+
 
 def create_model(
-        encoder_name: str = DEFAULT_ENCODER_NAME,
-        encoder_weights: Union[str, None] = DEFAULT_ENCODER_WEIGHTS,
-        in_channels: int = DEFAULT_IN_CHANNELS,
-        classes: int = DEFAULT_NUM_CLASSES,
-        stage_indices: Sequence[int] = DEFAULT_STAGE_INDICES,
-        use_das: bool = False,
-        descriptor_path: str = None,
-        **kwargs,
+    encoder_name: str = DEFAULT_ENCODER_NAME,
+    encoder_weights: Union[str, None] = DEFAULT_ENCODER_WEIGHTS,
+    in_channels: int = DEFAULT_IN_CHANNELS,
+    classes: int = DEFAULT_NUM_CLASSES,
+    stage_indices: Sequence[int] = DEFAULT_STAGE_INDICES,
+    use_swt: bool = False,             # ← 실험 시 True로 켜기
+    swt_stage_idx: int = 2,            # ← SWT 적용 stage (encoder.features index)
+    **kwargs,
 ) -> DeepLabV3PlusWrapper:
     base = smp.DeepLabV3Plus(
         encoder_name=encoder_name,
@@ -250,6 +188,6 @@ def create_model(
         base_model=base,
         stage_indices=stage_indices,
         num_classes=classes,
-        use_das=use_das,
-        descriptor_path=descriptor_path
+        use_swt=use_swt,
+        swt_stage_idx=swt_stage_idx,
     )

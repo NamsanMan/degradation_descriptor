@@ -28,18 +28,8 @@ def create_model(model_name: str):
         print(f"▶ Model '{[model_name]}' created.", flush=True)
 
     elif model_name == 'd3p':
-        # [NEW] config.MODEL에서 Descriptor 설정 가져오기
-        use_das = getattr(config.MODEL, 'USE_DESCRIPTOR', False)
-        desc_path = getattr(config.MODEL, 'DESCRIPTOR_PATH', None)
-
-        # d3p 호출 시 인자 전달
-        model = d3p(
-            classes=num_classes,
-            use_das=use_das,
-            descriptor_path=desc_path
-        )
-        das_status = "Enabled" if use_das else "Disabled"
-        print(f"▶ Model 'DeepLabV3 plus' created. (DAS: {das_status})")
+        model = d3p(classes=num_classes, use_swt=True, swt_stage_idx=2)
+        print(f"▶ Model 'DeepLabV3 plus' created.")
 
     elif model_name == 'ddrnet23slim':
         model = DDRNet23Slim(pretrained=True, num_classes=num_classes)
