@@ -3,6 +3,7 @@ from .kd_losses import BasicLogitKD
 from .cross_arch_seg_kd import CrossArchSegKD
 from .HMKD import HMKD
 from .gckd import GlobalContextKD
+from .swt_attention_kd import SWTTunedKDEngine
 
 # 사용할 수 있는 KD 엔진들을 등록
 KD_ENGINE_REGISTRY = {
@@ -10,7 +11,8 @@ KD_ENGINE_REGISTRY = {
     "logit": BasicLogitKD,
     "cross_arch_seg_kd": CrossArchSegKD,
     "hmkd": HMKD,
-    "gckd": GlobalContextKD
+    "gckd": GlobalContextKD,
+    "swt_attention": SWTTunedKDEngine,
     # 여기에 새로운 KD 엔진(예: "attention": AttentionKD)을 추가하면 됨
 }
 

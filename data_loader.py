@@ -15,8 +15,9 @@ class CamVidDataset(Dataset):
     #사용자 정의 Dataset 클래스는 반드시 3개 함수를 구현해야 합니다: __init__, __len__, and __getitem__.
 
     #__init__ 매서드(class안의 함수를 의미) Dataset 객체가 생성(instantiate)될 때 한 번만 실행됩니다. 여기서는 이미지와 주석 파일(annotation_file)이 포함된 디렉토리와 (다음 장에서 자세히 살펴볼) 두가지 변형(transform)을 초기화합니다.
-    def __init__(self, images_dir, masks_dir, file_list=None, transform=None):
+    def __init__(self, images_dir, masks_dir, file_list=None, transform=None, teacher_images_dir=None):
         self.images_dir = images_dir
+        self.teacher_images_dir = teacher_images_dir
         self.masks_dir = masks_dir
         if file_list:
             with open(file_list) as f:
@@ -31,13 +32,27 @@ class CamVidDataset(Dataset):
 
     #__getitem__ 함수는 주어진 인덱스 idx 에 해당하는 샘플을 데이터셋에서 불러오고 반환합니다.
     def __getitem__(self, idx):
-        img_path = os.path.join(self.images_dir, self.files[idx])       #이미지 파일들이 저장된 디렉토리 경로
-        mask_path = os.path.join(self.masks_dir, self.files[idx])       #레이블(마스크)가 저장된 디렉토리 경로
+        filename = self.files[idx]
+        img_path = os.path.join(self.images_dir, filename)       #이미지 파일들이 저장된 디렉토리 경로
+        mask_path = os.path.join(self.masks_dir, filename)       #레이블(마스크)가 저장된 디렉토리 경로
         image = Image.open(img_path).convert('RGB')                     #원본이 흑백이더라도 3채널로 맞춰 주며 3채널(RGB)형식으로 변환
         mask = Image.open(mask_path)  # 클래스 인덱스 그대로  >>>  주의해야될 점이, 마스크 파일이 png이고 0~11값이 class이어야 하고, void가 11이어야 함
 
+        teacher_image = None
+        if self.teacher_images_dir is not None:
+            teacher_path = os.path.join(self.teacher_images_dir, filename)
+            if not os.path.exists(teacher_path):
+                raise FileNotFoundError(f"Teacher HR image not found: {teacher_path}")
+            teacher_image = Image.open(teacher_path).convert('RGB')
+
         if self.transform:
-            image, mask = self.transform(image, mask)
+            if teacher_image is not None:
+                image, mask, teacher_image = self.transform(image, mask, teacher_image)
+            else:
+                image, mask = self.transform(image, mask)
+
+        if teacher_image is not None:
+            return (image, teacher_image), mask
         return image, mask
 
 # ──────────────────────────────────────────────────────────────────
@@ -240,16 +255,121 @@ class SegmentationTransform:
         mask = torch.from_numpy(mask_np).long()
         return img, mask
 
+class JointKDTrainAugmentation:
+    """학생(LR)과 교사(HR) 이미지를 동일한 기하 변환으로 다루는 KD 전용 변환."""
+
+    def __init__(
+        self,
+        size,
+        hflip_prob: float = 0.5,
+        crop_prob: float = 0.7,
+        crop_range: tuple[float, float] = (80.0, 100.0),
+        rotation_prob: float = 0.2,
+        rotation_degree: float = 5.0,
+        brightness: tuple[float, float] = (0.6, 1.4),
+        contrast: tuple[float, float]   = (0.7, 1.2),
+        saturation: tuple[float, float] = (0.9, 1.3),
+        hue: tuple[float, float]        = (-0.05, 0.05),
+        pdm_transform: PDMPatchMix | None = None,
+    ):
+        self.size = size
+        self.hflip_prob = hflip_prob
+        self.crop_prob = crop_prob
+        self.crop_min, self.crop_max = crop_range
+        self.rotation_prob = rotation_prob
+        self.rotation_degree = rotation_degree
+        self.brightness = brightness
+        self.contrast   = contrast
+        self.saturation = saturation
+        self.hue        = hue
+        self.pdm = pdm_transform
+
+    def _color_jitter_student(self, img):
+        jitter = T.ColorJitter(
+            brightness=self.brightness,
+            contrast=self.contrast,
+            saturation=self.saturation,
+            hue=self.hue,
+        )
+        return jitter(img)
+
+    def __call__(self, img_student, mask, img_teacher=None):
+        # 학생 입력만 추가 열화 적용
+        if self.pdm is not None:
+            img_student = self.pdm(img_student)
+
+        img_teacher = img_teacher if img_teacher is not None else img_student
+
+        # 초기 리사이즈
+        img_student = F.resize(img_student, self.size)
+        img_teacher = F.resize(img_teacher, self.size)
+        mask = F.resize(mask, self.size, interpolation=InterpolationMode.NEAREST)
+
+        # 동일 파라미터의 랜덤 크롭
+        if random.random() < self.crop_prob:
+            target_h, target_w = self.size
+            scale_min = self.crop_min / 100.0
+            scale_max = self.crop_max / 100.0
+            crop_h = int(random.uniform(scale_min, scale_max) * target_h)
+            crop_w = int(random.uniform(scale_min, scale_max) * target_w)
+            i, j, h, w = T.RandomCrop.get_params(img_student, output_size=(crop_h, crop_w))
+            img_student = F.crop(img_student, i, j, h, w)
+            img_teacher = F.crop(img_teacher, i, j, h, w)
+            mask = F.crop(mask, i, j, h, w)
+            img_student = F.resize(img_student, self.size, interpolation=InterpolationMode.BILINEAR)
+            img_teacher = F.resize(img_teacher, self.size, interpolation=InterpolationMode.BILINEAR)
+            mask = F.resize(mask, self.size, interpolation=InterpolationMode.NEAREST)
+
+        # 랜덤 수평 뒤집기
+        if random.random() < self.hflip_prob:
+            img_student = F.hflip(img_student)
+            img_teacher = F.hflip(img_teacher)
+            mask = F.hflip(mask)
+
+        # 랜덤 회전
+        if random.random() < self.rotation_prob:
+            angle = random.uniform(-self.rotation_degree, self.rotation_degree)
+            img_student = F.rotate(img_student, angle, interpolation=InterpolationMode.BILINEAR)
+            img_teacher = F.rotate(img_teacher, angle, interpolation=InterpolationMode.BILINEAR)
+            mask = F.rotate(mask, angle, interpolation=InterpolationMode.NEAREST)
+
+        # 학생만 컬러 지터로 추가 변형
+        img_student = self._color_jitter_student(img_student)
+
+        # Tensor 및 정규화
+        img_student = F.to_tensor(img_student)
+        img_student = F.normalize(img_student, mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+
+        img_teacher = F.to_tensor(img_teacher)
+        img_teacher = F.normalize(img_teacher, mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+
+        mask_np = np.array(mask, dtype=np.int64)
+        mask_np[(mask_np < 0) | (mask_np > config.DATA.IGNORE_INDEX)] = config.DATA.IGNORE_INDEX
+        mask = torch.from_numpy(mask_np).long()
+
+        return img_student, mask, img_teacher
+
+
+_train_teacher_dir = config.DATA.TRAIN_TEACHER_IMG_DIR
+if _train_teacher_dir is not None and os.path.exists(_train_teacher_dir):
+    _train_transform = JointKDTrainAugmentation(
+        size=config.DATA.INPUT_RESOLUTION,
+        pdm_transform=PDMPatchMix(config.PDM)
+    )
+else:
+    _train_teacher_dir = None
+    _train_transform = TrainAugmentation(
+        size=config.DATA.INPUT_RESOLUTION,
+        pdm_transform=PDMPatchMix(config.PDM)
+    )
 
 # A_set 만 B_set으로 바꿔서 2fold 진행
 train_dataset = CamVidDataset(
     images_dir = config.DATA.TRAIN_IMG_DIR,
     masks_dir  = config.DATA.TRAIN_LABEL_DIR,
     file_list = config.DATA.FILE_LIST,
-    transform =TrainAugmentation(
-        size=config.DATA.INPUT_RESOLUTION,
-        pdm_transform=PDMPatchMix(config.PDM)
-    )
+    transform = _train_transform,
+    teacher_images_dir=_train_teacher_dir,
 )
 
 val_dataset = CamVidDataset(

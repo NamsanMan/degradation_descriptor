@@ -24,18 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Bset_LR_seg5_new\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Bset_LR_d3presnet50_swt_attention_module_test"
+    PROJECT_NAME = "Aset_segb3_300epoch_debug"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -52,16 +53,24 @@ class GENERAL:
 # ──────────────────────────────────────────────────────────────────
 class DATA:
     # 데이터셋 경로
+    DATA_HR_DIR   = DATA_HR_DIR  # data_loader에서 사용하던 경로
+    TRAIN_HR_DIR = DATA_HR_DIR / "train"
+    VAL_HR_DIR = DATA_HR_DIR / "val"
+    TEST_HR_DIR = DATA_HR_DIR / "test"
+
     DATA_DIR   = DATA_DIR  # data_loader에서 사용하던 경로
     TRAIN_DIR = DATA_DIR / "train"
     VAL_DIR = DATA_DIR / "val"
     TEST_DIR = DATA_DIR / "test"
 
     TRAIN_IMG_DIR = TRAIN_DIR / "images"
+    TRAIN_TEACHER_IMG_DIR = TRAIN_HR_DIR / "images"  # teacher(HR) 전용 오프라인 클린 이미지
     TRAIN_LABEL_DIR = TRAIN_DIR / "labels"
     VAL_IMG_DIR = VAL_DIR / "images"
+    VAL_TEACHER_IMG_DIR = VAL_HR_DIR / "images"
     VAL_LABEL_DIR = VAL_DIR / "labels"
     TEST_IMG_DIR = TEST_DIR / "images"
+    TEST_TEACHER_IMG_DIR = TEST_HR_DIR / "images"
     TEST_LABEL_DIR = TEST_DIR / "labels"
 
     FILE_LIST = None
@@ -145,7 +154,7 @@ class MODEL:
 # 4. TRAIN: 훈련 과정 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class TRAIN:
-    EPOCHS = 150
+    EPOCHS = 300
     USE_WARMUP = True
     WARMUP_EPOCHS = 5
 
@@ -201,9 +210,9 @@ class TRAIN:
 # 5. KD: Knowledge Distillation 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class KD:
-    ENABLE = False
+    ENABLE = True
 
-    ENGINE_NAME = "logit"
+    ENGINE_NAME = "swt_attention"
     """
     available engines:
     segtoseg
@@ -214,7 +223,7 @@ class KD:
     """
 
     # 모델 선택
-    TEACHER_NAME = 'segformerb5'
+    TEACHER_NAME = 'segformerb3'
     STUDENT_NAME = 'segformerb0'
     # 이미 학습된 teacher .pth 경로 (없으면 None), KD경로는 일단 colab경로로 해놓음
 
@@ -298,6 +307,17 @@ class KD:
             "use_wrob": True,  # w_rob 사용 여부
             "beta": 0.5,  # exp( -beta * ||…||^2 )
             "freeze_teacher": True,  # True면 깨끗한 입력을 함께 넘긴다는 가정
+        },
+        "swt_attention": {
+            "w_ce_student": 1.0,
+            "w_kd_logit": 0.2,
+            "w_kd_feat": 0.5,
+            "temperature": 2.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "teacher_stage": -2,
+            "student_stage": -2,
+            "energy_temperature": 1.5,
+            "freeze_teacher": FREEZE_TEACHER,
         }
     }
 
