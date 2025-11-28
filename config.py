@@ -36,7 +36,7 @@ else:
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Aset_segb3_300epoch_debug"
+    PROJECT_NAME = "Aset_swtKD_debug_stage_index2"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -135,7 +135,7 @@ class PDM:
 # ──────────────────────────────────────────────────────────────────
 
 class MODEL:
-    NAME = 'd3p'
+    NAME = 'segformerb0'
 
     """
     available models:
@@ -154,7 +154,7 @@ class MODEL:
 # 4. TRAIN: 훈련 과정 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class TRAIN:
-    EPOCHS = 300
+    EPOCHS = 150
     USE_WARMUP = True
     WARMUP_EPOCHS = 5
 
@@ -220,6 +220,7 @@ class KD:
     cross_arch_seg_kd   # cross_arch_seg_kd는 discriminator의 추가적인 parameter때문에 main_CAKD, train_CAKD를 별도로 이용해야됨
     hmkd
     gckd
+    swt_attention
     """
 
     # 모델 선택
@@ -314,10 +315,11 @@ class KD:
             "w_kd_feat": 0.5,
             "temperature": 2.0,
             "ignore_index": DATA.IGNORE_INDEX,
-            "teacher_stage": -2,
-            "student_stage": -2,
+            "teacher_stage": 2,
+            "student_stage": 2,
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
+            "high_ce_scale": 0.3,
         }
     }
 

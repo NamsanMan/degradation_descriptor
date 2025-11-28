@@ -69,11 +69,15 @@ class SWTTunedKDEngine(BaseKDEngine):
         self.energy_temperature = float(energy_temperature)
         self._freeze_teacher = bool(freeze_teacher)
 
+        # 기본 CE는 더 이상 직접 사용하지 않지만, 인터페이스 유지 차원에서 남겨둔다.
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
         self.kl_loss = nn.KLDivLoss(reduction="none")
 
         # Optional 1x1 projections to align student feature channels to teacher.
         self.feat_adapters = nn.ModuleDict()
+
+        # high-attention 영역에서 CE를 얼마나 줄일지 (0이면 완전 off, 1이면 기존과 동일)
+        self.high_ce_scale = 0.3  # 필요하면 config로 빼도 됨.
 
         if self._freeze_teacher:
             for p in self.teacher.parameters():
@@ -174,6 +178,53 @@ class SWTTunedKDEngine(BaseKDEngine):
         loss = (pixel_loss.unsqueeze(1) * weight).sum() / denom
         return loss * (self.temperature ** 2)
 
+    def _ce_with_attention(self, s_logits: torch.Tensor, masks: torch.Tensor, energy_attn: torch.Tensor):
+        """
+        CE를 high-attention / low-attention으로 분리해서 계산.
+        high 영역에서는 self.high_ce_scale만큼만 CE를 반영.
+        """
+        # per-pixel CE: (B,H,W)
+        ce_map = F.cross_entropy(
+            s_logits,
+            masks,
+            ignore_index=self.ignore_index,
+            reduction="none",
+        )  # (B,H,W)
+
+        valid_mask = (masks != self.ignore_index).float().unsqueeze(1)  # (B,1,H,W)
+
+        # attention 해상도를 logits에 맞춤
+        attn = energy_attn
+        if attn.shape[-2:] != s_logits.shape[-2:]:
+            attn = F.interpolate(
+                attn,
+                size=s_logits.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+
+        # high / low attention mask (상위 20% vs 나머지)
+        attn_flat = attn.view(attn.size(0), -1)
+        q_high = torch.quantile(attn_flat, 0.8, dim=1, keepdim=True)  # (B,1)
+        high_mask = (attn_flat >= q_high).view_as(attn)               # (B,1,H,W)
+        low_mask = ~high_mask                                         # bool
+
+        high_mask = high_mask.float() * valid_mask  # ignore_index 제외
+        low_mask = low_mask.float() * valid_mask
+
+        ce_map = ce_map.unsqueeze(1)  # (B,1,H,W)
+
+        denom_low = low_mask.sum().clamp(min=1.0)
+        denom_high = high_mask.sum().clamp(min=1.0)
+
+        ce_low = (ce_map * low_mask).sum() / denom_low
+        ce_high = (ce_map * high_mask).sum() / denom_high
+
+        # high-attention 영역 CE를 약하게 (KD에 더 의존)
+        ce_total = ce_low + self.high_ce_scale * ce_high
+
+        return ce_total, ce_low.detach(), ce_high.detach()
+
     def compute_losses(self, imgs, masks, device):
         s_imgs, t_imgs = self._parse_inputs(imgs)
         s_logits, s_feats = self._forward_with_feats(self.student, s_imgs)
@@ -187,21 +238,30 @@ class SWTTunedKDEngine(BaseKDEngine):
         s_feats = tuple(s_feats)
         t_feats = tuple(t_feats)
 
-        ce_student = self.ce_loss(s_logits, masks)
-
+        # teacher feature에서 SWT energy / attention 추출
         t_feat_sel = self._select_feat(t_feats, self.teacher_stage)
         s_feat_sel = self._select_feat(s_feats, self.student_stage)
         s_feat_sel = self._maybe_project_student_feat(s_feat_sel, t_feat_sel)
         raw_energy, energy_attn = self._energy_map(t_feat_sel)
 
+        # CE: high / low attention 분리
+        ce_student, ce_low, ce_high = self._ce_with_attention(s_logits, masks, energy_attn)
+
+        # KD는 기존과 동일하게 attention 사용
         kd_logit = self._weighted_logit_kd(s_logits, t_logits, masks, energy_attn)
         kd_feat = self._weighted_feat_loss(s_feat_sel, t_feat_sel, energy_attn)
 
-        total = self.w_ce_student * ce_student + self.w_kd_logit * kd_logit + self.w_kd_feat * kd_feat
+        total = (
+            self.w_ce_student * ce_student
+            + self.w_kd_logit * kd_logit
+            + self.w_kd_feat * kd_feat
+        )
 
         return {
             "total": total,
             "ce_student": ce_student.detach(),
+            "ce_student_low": ce_low,
+            "ce_student_high": ce_high,
             "kd_logit": kd_logit.detach(),
             "kd_feat": kd_feat.detach(),
             "s_logits": s_logits.detach(),
