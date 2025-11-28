@@ -59,7 +59,6 @@ def _display_name_for_loss(key: str) -> str:
         pretty = f"{pretty} Loss"
     return pretty
 
-
 # model 설정
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 teacher = create_model(config.KD.TEACHER_NAME).to(device)
@@ -94,7 +93,6 @@ if config.KD.FREEZE_TEACHER:
 # ── KD 엔진 구성 ───────────────────────────────────
 kd_engine = create_kd_engine(config.KD, teacher, student).to(device)
 
-
 def _move_to_device(obj, device):
     if torch.is_tensor(obj):
         return obj.to(device, non_blocking=True)
@@ -104,17 +102,14 @@ def _move_to_device(obj, device):
         return {k: _move_to_device(v, device) for k, v in obj.items()}
     return obj
 
-
 # --- build KD projections (dry-run) so their params are included in optimizer ---
 imgs0, masks0 = next(iter(data_loader.train_loader))
 imgs0 = _move_to_device(imgs0, device)
 masks0 = masks0.to(device, non_blocking=True)
 with torch.no_grad():
-    dry_run_out = kd_engine.compute_losses(
-        imgs0,
-        masks0,
-        device
-    )
+    dry_run_out = kd_engine.compute_losses(imgs0,
+                                           masks0,
+                                           device)
 
 if "total" not in dry_run_out:
     raise KeyError("KD engine must return a 'total' loss entry.")
@@ -157,7 +152,6 @@ if config.TRAIN.USE_WARMUP:
     warmup = warmup_class(optimizer, **warmup_params)
 else:
     warmup = None
-
 
 def _mask_to_grid(mask_tensor: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Convert integer masks (B,H,W) to a grid for TensorBoard logging."""
@@ -242,7 +236,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                 writer.add_scalar(f"train/{key}", _loss_value_to_float(value), global_step)
 
             if batch_idx == 0:
-                swt_map = out.get("swt_energy")
+                swt_map  = out.get("swt_energy")
                 swt_attn = out.get("swt_attention")
                 s_logits = out.get("s_logits")
 
@@ -290,7 +284,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                     s_pred = torch.argmax(s_logits, dim=1)  # (B,H,W)
                     gt = masks                             # (B,H,W)
 
-                    # --- A. error map for visualization ---
+                    # --- A. error map for visualization (원래 코드와 동일) ---
                     err_map = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
 
                     if swt_attn.shape[-2:] != err_map.shape[-2:]:
@@ -313,7 +307,8 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                         global_step=epoch,
                     )
 
-                    # --- B. attention quantile별 error rate ---
+                    # --- B. attention quantile별 error rate (해상도 맞춰서 계산) ---
+                    # err, attn 해상도 통일: logits / GT 해상도 기준으로 맞춤
                     err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
                     attn_full = swt_attn
                     if attn_full.shape[-2:] != err_full.shape[-2:]:
@@ -325,14 +320,14 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                         )
 
                     # (B, H*W)
-                    err_f = err_full.view(err_full.size(0), -1)
+                    err_f  = err_full.view(err_full.size(0), -1)
                     attn_f = attn_full.view(attn_full.size(0), -1)
 
                     # 배치별 quantile
-                    q_low = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
+                    q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
                     q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
 
-                    low_mask = attn_f <= q_low   # (B, H*W)
+                    low_mask  = attn_f <= q_low   # (B, H*W)
                     high_mask = attn_f >= q_high  # (B, H*W)
 
                     # mask가 비는 경우 방어
@@ -351,6 +346,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                             epoch,
                         )
 
+
                 # 기존 입력/예측/GT/학생-교사 불일치 시각화
                 _log_segmentation_comparison(
                     writer,
@@ -360,6 +356,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                     global_step=global_step,
                     num_classes=config.DATA.NUM_CLASSES,
                 )
+
 
         postfix = {}
         for key in SCALAR_LOSS_KEYS:
@@ -376,8 +373,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
     avg_losses = {key: val / num_batches for key, val in epoch_losses.items()}
     return avg_losses
 
-
-# ── (변경) 검증(학생 기준) ─────────────────────────────
+# ── (변경) 검증(학생 기준) ─────────────────────────────────
 def validate_student(student_model, loader, criterion):
     student_model.eval()
     total_loss = 0.0
@@ -388,18 +384,14 @@ def validate_student(student_model, loader, criterion):
             total_loss += criterion(preds, masks).item()
     return total_loss / len(loader)
 
-
 def plot_progress(epochs, train_losses, val_losses):
-    plt.figure(figsize=(8, 6))
+    plt.figure(figsize=(8,6))
     plt.plot(epochs, train_losses, label="Train Loss")
-    plt.plot(epochs, val_losses, label="Val Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.grid(True)
+    plt.plot(epochs, val_losses,   label="Val Loss")
+    plt.xlabel("Epoch"); plt.ylabel("Loss")
+    plt.legend(); plt.grid(True)
     plt.savefig(str(config.GENERAL.SAVE_PLOT), bbox_inches="tight")
     plt.close()
-
 
 def write_summary(init=False, best_epoch=None, best_miou=None):
     # 기존 동일 (단, 모델명은 학생/교사 둘 표시 권장)
@@ -439,7 +431,6 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
             f.write(f"epoch     : {best_epoch}\n")
             f.write(f"best_val_mIoU : {best_miou:.4f}\n\n")
 
-
 def write_timing(start_dt, end_dt, path=config.GENERAL.SUMMARY_TXT):
     elapsed = end_dt - start_dt
     total_sec = int(elapsed.total_seconds())
@@ -451,128 +442,6 @@ def write_timing(start_dt, end_dt, path=config.GENERAL.SUMMARY_TXT):
         f.write(f"Start : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End   : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total : {hh:02d}:{mm:02d}:{ss:02d} (H:M:S)\n\n")
-
-
-# ── SWT attention 기반 high-attention 영역 평가 함수 ─────────────
-@torch.no_grad()
-def evaluate_high_attention_region(
-    kd_engine,
-    loader,
-    device,
-    num_classes: int,
-    ignore_index: int,
-    top_p: float = 0.2,
-):
-    """
-    KD 엔진의 SWT attention을 이용해서
-    - 전체 영역 전체 IoU / PixelAcc
-    - high-attention(top_p) 영역에서의 IoU / PixelAcc
-    를 별도로 계산하는 함수.
-
-    kd_engine.compute_losses()가
-      - 's_logits'       : (B,C,H,W)
-      - 'swt_attention'  : (B,1,h,w)
-    을 반환한다는 가정.
-    """
-    kd_engine.eval()
-
-    conf_all = torch.zeros(num_classes, num_classes, device=device, dtype=torch.long)
-    conf_high = torch.zeros(num_classes, num_classes, device=device, dtype=torch.long)
-
-    for imgs, masks in loader:
-        imgs = _move_to_device(imgs, device)
-        masks = masks.to(device, non_blocking=True)
-
-        out = kd_engine.compute_losses(imgs, masks, device)
-        s_logits = out["s_logits"]          # (B,C,H,W)
-        swt_attn = out["swt_attention"]     # (B,1,h,w)
-
-        if swt_attn is None:
-            raise RuntimeError("swt_attention is None in kd_engine output.")
-
-        preds = torch.argmax(s_logits, dim=1)   # (B,H,W)
-        valid = (masks != ignore_index)         # (B,H,W)
-
-        B, H, W = preds.shape
-
-        # attention 해상도를 prediction과 맞추기
-        if swt_attn.shape[-2:] != (H, W):
-            attn_full = F.interpolate(
-                swt_attn,
-                size=(H, W),
-                mode="bilinear",
-                align_corners=False,
-            )
-        else:
-            attn_full = swt_attn
-        attn_full = attn_full.squeeze(1)  # (B,H,W)
-
-        # ── 전체 영역 confusion matrix ──
-        preds_flat_all = preds[valid]
-        target_flat_all = masks[valid]
-
-        if preds_flat_all.numel() == 0:
-            continue
-
-        idx_all = target_flat_all * num_classes + preds_flat_all
-        binc_all = torch.bincount(
-            idx_all,
-            minlength=num_classes * num_classes,
-        )
-        conf_all += binc_all.view(num_classes, num_classes)
-
-        # ── high-attention (top_p) 영역 ──
-        attn_valid = attn_full[valid]  # (N_valid,)
-        if attn_valid.numel() == 0:
-            continue
-
-        thr = torch.quantile(attn_valid, 1.0 - top_p)
-        high_mask = (attn_full >= thr) & valid  # (B,H,W) & valid
-
-        if not high_mask.any():
-            continue
-
-        preds_flat_high = preds[high_mask]
-        target_flat_high = masks[high_mask]
-
-        idx_high = target_flat_high * num_classes + preds_flat_high
-        binc_high = torch.bincount(
-            idx_high,
-            minlength=num_classes * num_classes,
-        )
-        conf_high += binc_high.view(num_classes, num_classes)
-
-    def _conf_to_metrics(conf: torch.Tensor):
-        # conf[t,p] : GT=t, Pred=p
-        tp = torch.diag(conf).float()
-        fp = conf.sum(dim=0).float() - tp
-        fn = conf.sum(dim=1).float() - tp
-        denom = tp + fp + fn
-        iou = tp / denom.clamp(min=1e-6)        # (num_classes,)
-
-        total_correct = tp.sum()
-        total = conf.sum().clamp(min=1e-6)
-        pa = total_correct / total
-        miou = iou.mean()
-
-        return miou.item(), pa.item(), iou.cpu().tolist()
-
-    miou_all, pa_all, percls_all = _conf_to_metrics(conf_all)
-    miou_high, pa_high, percls_high = _conf_to_metrics(conf_high)
-
-    return {
-        "all": {
-            "mIoU": miou_all,
-            "PixelAcc": pa_all,
-            "per_class_iou": percls_all,
-        },
-        "high": {
-            "mIoU": miou_high,
-            "PixelAcc": pa_high,
-            "per_class_iou": percls_high,
-        },
-    }
-
 
 # 학습 진행 및 잘 되고있나 성능평가
 def run_training(num_epochs):
@@ -633,7 +502,7 @@ def run_training(num_epochs):
             warmup.step()
         else:
             # ReduceLROnPlateau 사용시
-            # scheduler.step(vl_loss)
+            #scheduler.step(vl_loss)
             # 미사용시
             scheduler.step()
 
@@ -667,6 +536,7 @@ def run_training(num_epochs):
         per_cls_iou = metrics["per_class_iou"]
         for i in range(config.DATA.NUM_CLASSES):
             log_data[f"IoU_{config.DATA.CLASS_NAMES[i]}"] = float(per_cls_iou[i])
+
 
         # DataFrame으로 변환 후 CSV 파일에 append
         df_new_row = pd.DataFrame([log_data]).reindex(columns=csv_headers)
@@ -709,34 +579,7 @@ def run_training(num_epochs):
     print(f"Total time : {hh:02d}:{mm:02d}:{ss:02d} (H:M:S)")
     print(f"Best epoch: {best_epoch}, Best val_mIoU: {best_miou:.4f}")
 
-    # === best student 기준 high-attention 영역 평가 ===
-    try:
-        best_ckpt_data = torch.load(best_ckpt, map_location=device)
-        student.load_state_dict(best_ckpt_data["model_state"])
-        kd_engine.student = student  # 엔진 내부 student 갱신
-
-        ignore_index = config.TRAIN.LOSS_FN["PARAMS"].get("ignore_index", 255)
-
-        ha_metrics = evaluate_high_attention_region(
-            kd_engine=kd_engine,
-            loader=data_loader.val_loader,
-            device=device,
-            num_classes=config.DATA.NUM_CLASSES,
-            ignore_index=ignore_index,
-            top_p=0.2,  # 상위 20% attention
-        )
-
-        print("\n[High-attention region evaluation (top 20% SWT attention)]")
-        print(f"  All-pixel     mIoU={ha_metrics['all']['mIoU']:.4f}, "
-              f"PA={ha_metrics['all']['PixelAcc']:.4f}")
-        print(f"  High-att(20%) mIoU={ha_metrics['high']['mIoU']:.4f}, "
-              f"PA={ha_metrics['high']['PixelAcc']:.4f}")
-
-    except Exception as e:
-        print(f"⚠ High-attention evaluation failed: {e}")
-
     return best_ckpt
-
 
 if __name__ == "__main__":
     run_training(config.TRAIN.EPOCHS)
