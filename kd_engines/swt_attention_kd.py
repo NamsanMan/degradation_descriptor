@@ -57,6 +57,7 @@ class SWTTunedKDEngine(BaseKDEngine):
         student_stage: int = -2,
         energy_temperature: float = 1.5,
         freeze_teacher: bool = True,
+        high_ce_scale: float = 0.3,
     ) -> None:
         super().__init__(teacher, student)
         self.w_ce_student = float(w_ce_student)
@@ -77,7 +78,7 @@ class SWTTunedKDEngine(BaseKDEngine):
         self.feat_adapters = nn.ModuleDict()
 
         # high-attention 영역에서 CE를 얼마나 줄일지 (0이면 완전 off, 1이면 기존과 동일)
-        self.high_ce_scale = 0.3  # 필요하면 config로 빼도 됨.
+        self.high_ce_scale = float(high_ce_scale)
 
         if self._freeze_teacher:
             for p in self.teacher.parameters():
