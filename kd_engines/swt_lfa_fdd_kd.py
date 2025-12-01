@@ -262,20 +262,13 @@ class SWTLFAFDDKDEngine(BaseKDEngine):
 
         # 2) dict 입력: 키를 통해 LR/HR를 명확히 구분 (모호성 제거)
         if isinstance(imgs, dict):
-            student_img = imgs.get("student")
-            teacher_img = imgs.get("teacher")
-
+            student_img = imgs.get("student", imgs.get("lr"))
+            teacher_img = imgs.get("teacher", imgs.get("hr", student_img))
             if student_img is None:
-                student_img = imgs.get("lr")
+                student_img = teacher_img
             if teacher_img is None:
-                teacher_img = imgs.get("hr")
-
-            if student_img is None or teacher_img is None:
-                raise KeyError(
-                    "Dict input for KD must contain LR (student or lr) and HR (teacher or hr) entries."
-                )
+                teacher_img = student_img
             return student_img, teacher_img
-
         # 3) 단일 텐서 입력: student/teacher 모두 동일 이미지 사용
         return imgs, imgs
 

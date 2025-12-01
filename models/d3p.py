@@ -9,7 +9,7 @@ import segmentation_models_pytorch as smp
 from models.swt_attention import SWTFrequencyAttention  # ← SWT 모듈
 from config import DATA
 
-DEFAULT_ENCODER_NAME     = "mobilenet_v2"
+DEFAULT_ENCODER_NAME     = "resnet50"
 DEFAULT_ENCODER_WEIGHTS  = "imagenet"
 DEFAULT_IN_CHANNELS      = 3
 DEFAULT_NUM_CLASSES      = DATA.NUM_CLASSES
