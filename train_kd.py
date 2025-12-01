@@ -239,6 +239,7 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                 swt_map  = out.get("swt_energy")
                 swt_attn = out.get("swt_attention")
                 s_logits = out.get("s_logits")
+                band_w   = out.get("freq_band_weight")
 
                 # 1) SWT energy / attention 기본 시각화 + 히스토그램
                 if swt_map is not None:
@@ -345,6 +346,13 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                             err_high.item(),
                             epoch,
                         )
+
+                # 4) Learnable frequency band weights (mean over batch)
+                if band_w is not None and torch.is_tensor(band_w) and band_w.numel() >= 3:
+                    band_mean = band_w.detach().float().mean(dim=0)
+                    writer.add_scalar("train/freq_w_LH", band_mean[0].item(), global_step)
+                    writer.add_scalar("train/freq_w_HL", band_mean[1].item(), global_step)
+                    writer.add_scalar("train/freq_w_HH", band_mean[2].item(), global_step)
 
 
                 # 기존 입력/예측/GT/학생-교사 불일치 시각화

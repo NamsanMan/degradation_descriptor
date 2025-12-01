@@ -94,6 +94,19 @@ class FeatureAdaptationModule(nn.Module):
             nn.BatchNorm2d(out_channels),
         )
 
+        # 안정적인 학습을 위한 초기화
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.block(x)
         if self.use_residual:
@@ -231,17 +244,39 @@ class SWTLFAFDDKDEngine(BaseKDEngine):
 
     @staticmethod
     def _parse_inputs(imgs) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Accept (student, teacher) tuple/dict, otherwise share the same tensor.
-        if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
+        """
+        입력 형태를 표준화해 student(LR) / teacher(HR) 텐서를 반환.
+
+        지원 형태:
+          - (student, teacher) tuple/list
+          - {"lr"/"student", "hr"/"teacher"} dict
+          - 단일 Tensor (student/teacher 동일 이미지)
+        """
+        # 1) 명시적 tuple/list 입력: (student, teacher) 순서를 강제
+        if isinstance(imgs, (tuple, list)):
+            if len(imgs) != 2:
+                raise ValueError(
+                    "KD engine expects a (student, teacher) pair when imgs is a tuple/list."
+                )
             return imgs[0], imgs[1]
+
+        # 2) dict 입력: 키를 통해 LR/HR를 명확히 구분 (모호성 제거)
         if isinstance(imgs, dict):
-            student_img = imgs.get("student", imgs.get("lr"))
-            teacher_img = imgs.get("teacher", imgs.get("hr", student_img))
+            student_img = imgs.get("student")
+            teacher_img = imgs.get("teacher")
+
             if student_img is None:
-                student_img = teacher_img
+                student_img = imgs.get("lr")
             if teacher_img is None:
-                teacher_img = student_img
+                teacher_img = imgs.get("hr")
+
+            if student_img is None or teacher_img is None:
+                raise KeyError(
+                    "Dict input for KD must contain LR (student or lr) and HR (teacher or hr) entries."
+                )
             return student_img, teacher_img
+
+        # 3) 단일 텐서 입력: student/teacher 모두 동일 이미지 사용
         return imgs, imgs
 
     # --------------------------------------------------------
@@ -273,6 +308,7 @@ class SWTLFAFDDKDEngine(BaseKDEngine):
         """
         HF subband 절대값의 global 평균을 이용해 (B,3) descriptor 생성.
         """
+
         def _mean_abs(x: torch.Tensor) -> torch.Tensor:
             return x.abs().mean(dim=(1, 2, 3))  # (B,)
 
@@ -427,34 +463,44 @@ class SWTLFAFDDKDEngine(BaseKDEngine):
         band_weights: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Frequency-Domain Distillation (FDD)
+        [Corrected] Frequency-Domain Distillation (FDD)
+        Instance-wise weighting을 유지하며 Loss를 계산.
 
-        L_freq = λ_LL * ||LL_s - LL_t||^2 + λ_HF * Σ_k w_k * ||Subband^k_s - Subband^k_t||^2
-
-        - band_weights: (B,3) = [w_LH, w_HL, w_HH] from LFA
+        L_freq = λ_LL * ||LL_s - LL_t||^2
+               + λ_HF * E_{b,c,h,w}[ w_LH(b) * (LH_s - LH_t)^2
+                                    + w_HL(b) * (HL_s - HL_t)^2
+                                    + w_HH(b) * (HH_s - HH_t)^2 ]
         """
-        # spatial size align
+        # 1. Spatial Size Align (Student -> Teacher size)
         if s_feat.shape[-2:] != t_feat.shape[-2:]:
             s_feat = F.interpolate(s_feat, size=t_feat.shape[-2:], mode="bilinear", align_corners=True)
 
+        # 2. Decomposition
         ll_s, lh_s, hl_s, hh_s = self._swt_decompose(s_feat)
         ll_t, lh_t, hl_t, hh_t = self._swt_decompose(t_feat.detach())
 
-        # mean-squared error per subband
-        ll_loss = (ll_s - ll_t).pow(2).mean()
+        # 3. Calculate Squared Diff (No reduction yet)  (B, C, H, W)
+        diff_ll = (ll_s - ll_t).pow(2)
+        diff_lh = (lh_s - lh_t).pow(2)
+        diff_hl = (hl_s - hl_t).pow(2)
+        diff_hh = (hh_s - hh_t).pow(2)
 
-        lh_loss = (lh_s - lh_t).pow(2).mean()
-        hl_loss = (hl_s - hl_t).pow(2).mean()
-        hh_loss = (hh_s - hh_t).pow(2).mean()
+        # 4. Apply Learnable Weights (Instance-wise)
+        # band_weights: (B, 3) -> reshape to (B, 1, 1, 1) for broadcasting
+        w_lh = band_weights[:, 0].view(-1, 1, 1, 1)
+        w_hl = band_weights[:, 1].view(-1, 1, 1, 1)
+        w_hh = band_weights[:, 2].view(-1, 1, 1, 1)
 
-        # band scalar weight: batch-wise 평균 사용
-        w_lh = band_weights[:, 0].mean()
-        w_hl = band_weights[:, 1].mean()
-        w_hh = band_weights[:, 2].mean()
+        # Weighted HF Loss (instance-wise weight → 전체 mean)
+        loss_hf = (
+            w_lh * diff_lh +
+            w_hl * diff_hl +
+            w_hh * diff_hh
+        ).mean()
 
-        hf_loss = w_lh * lh_loss + w_hl * hl_loss + w_hh * hh_loss
+        loss_ll = diff_ll.mean()
 
-        return self.freq_ll_weight * ll_loss + self.freq_hf_weight * hf_loss
+        return self.freq_ll_weight * loss_ll + self.freq_hf_weight * loss_hf
 
     # --------------------------------------------------------
     # public API
@@ -493,7 +539,7 @@ class SWTLFAFDDKDEngine(BaseKDEngine):
         # Feature KD (spatial attention)
         kd_feat = self._weighted_feat_loss(s_feat_sel_proj, t_feat_sel, energy_attn)
 
-        # Frequency-domain KD
+        # Frequency-domain KD (instance-wise band weight 사용)
         kd_freq = self._frequency_distill_loss(s_feat_sel_proj, t_feat_sel, band_w)
 
         total = (
