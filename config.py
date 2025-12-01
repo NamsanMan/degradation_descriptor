@@ -25,7 +25,7 @@ else:
 
     # 기존에 사용하시던 로컬 경로 설정
     DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
@@ -36,7 +36,7 @@ else:
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Aset_swtKD_debug_stage_index2"
+    PROJECT_NAME = "Aset_swtLFAFDD"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -212,7 +212,7 @@ class TRAIN:
 class KD:
     ENABLE = True
 
-    ENGINE_NAME = "swt_attention"
+    ENGINE_NAME = "swt_lfa_fdd"
     """
     available engines:
     segtoseg
@@ -221,11 +221,12 @@ class KD:
     hmkd
     gckd
     swt_attention
+    swt_lfa_fdd
     """
 
     # 모델 선택
     TEACHER_NAME = 'segformerb3'
-    STUDENT_NAME = 'segformerb0'
+    STUDENT_NAME = 'd3p'
     # 이미 학습된 teacher .pth 경로 (없으면 None), KD경로는 일단 colab경로로 해놓음
 
     # 교사 고정 여부
@@ -315,11 +316,26 @@ class KD:
             "w_kd_feat": 0.5,
             "temperature": 2.0,
             "ignore_index": DATA.IGNORE_INDEX,
+            "teacher_stage": 0,
+            "student_stage": 0,
+            "energy_temperature": 1.5,
+            "freeze_teacher": FREEZE_TEACHER,
+            "high_ce_scale": 0.3,
+        },
+        "swt_lfa_fdd": {
+            "w_ce_student": 1.0,
+            "w_kd_logit": 1.0,
+            "w_kd_feat": 1.0,
+            "w_kd_freq": 1.0,
+            "temperature": 4.0,
+            "ignore_index": DATA.IGNORE_INDEX,
             "teacher_stage": 2,
             "student_stage": 2,
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
             "high_ce_scale": 0.3,
+            "freq_ll_weight": 1.0,
+            "freq_hf_weight": 1.0,
         }
     }
 
