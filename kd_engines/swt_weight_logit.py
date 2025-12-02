@@ -72,18 +72,24 @@ class SWTLogitKD(BaseKDEngine):
         feats = (feats,) if isinstance(feats, torch.Tensor) else tuple(feats)
         return logits, feats
 
-    def _energy_attention(self, feat: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _select_feat(feats: Tuple[torch.Tensor, ...], index: int) -> torch.Tensor:
+        if index < 0:
+            index = len(feats) + index
+        return feats[index]
+
+    def _energy_attention(self, feat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         swt = HaarSWT(feat.shape[1]).to(feat.device, feat.dtype)
         lh, hl, hh = swt(feat)[:, :, 1:4].unbind(dim=2)
 
         energy = (lh.abs() + hl.abs() + hh.abs()).mean(dim=1, keepdim=True)
-        energy = energy / (energy.mean(dim=[1, 2, 3], keepdim=True) + 1e-6)
+        norm_energy = energy / (energy.mean(dim=[1, 2, 3], keepdim=True) + 1e-6)
 
         attn = torch.softmax(
-            energy.flatten(2) * self.energy_temperature, dim=-1
-        ).view_as(energy)
+            norm_energy.flatten(2) * self.energy_temperature, dim=-1
+        ).view_as(norm_energy)
 
-        return attn.detach()
+        return energy.detach(), attn.detach()
 
     def compute_losses(self, imgs, masks, device):
         if isinstance(imgs, (tuple, list)):
@@ -91,12 +97,16 @@ class SWTLogitKD(BaseKDEngine):
         else:
             s_img = t_img = imgs
 
-        s_logits, _ = self._forward_with_feats(self.student, s_img)
+        s_logits, s_feats = self._forward_with_feats(self.student, s_img)
 
         with torch.no_grad():
             t_logits, t_feats = self._forward_with_feats(self.teacher, t_img)
-            t_feat = t_feats[self.teacher_stage]
-            attn = self._energy_attention(t_feat)
+            t_feat = self._select_feat(t_feats, self.teacher_stage)
+            energy_t, attn_t = self._energy_attention(t_feat)
+
+        with torch.no_grad():
+            s_feat = self._select_feat(s_feats, self.teacher_stage)
+            energy_s, attn_s = self._energy_attention(s_feat.detach())
 
         # ---- CE (standard) ----
         loss_ce = self.ce(s_logits, masks)
@@ -107,6 +117,7 @@ class SWTLogitKD(BaseKDEngine):
 
         kd_map = self.kl(log_ps, p_t).sum(dim=1)  # (B,H,W)
 
+        attn = attn_t
         if attn.shape[-2:] != kd_map.shape[-2:]:
             attn = F.interpolate(attn, kd_map.shape[-2:], mode="bilinear", align_corners=False)
 
@@ -122,5 +133,18 @@ class SWTLogitKD(BaseKDEngine):
             "total": total,
             "ce": loss_ce.detach(),
             "kd_logit": loss_kd.detach(),
-            "swt_attention": attn,
+            "s_logits": s_logits.detach(),
+            "t_logits": t_logits.detach(),
+            "student_input": s_img.detach(),
+            "teacher_input": t_img.detach(),
+
+            # Teacher SWT maps
+            "swt_energy": energy_t.detach(),
+            "swt_attention": attn.detach(),
+            "swt_energy_teacher": energy_t.detach(),
+            "swt_attention_teacher": attn.detach(),
+
+            # Student SWT maps
+            "swt_energy_student": energy_s.detach(),
+            "swt_attention_student": attn_s.detach(),
         }

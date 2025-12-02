@@ -222,6 +222,7 @@ class KD:
     gckd
     swt_attention
     swt_lfa_fdd
+    swt_weight_logit
     """
 
     # 모델 선택
@@ -336,6 +337,15 @@ class KD:
             "high_ce_scale": 0.3,
             "freq_ll_weight": 1.0,
             "freq_hf_weight": 1.0,
+        },
+        "swt_weight_logit": {
+            "w_ce": 1.0,
+            "w_kd": 0.2,
+            "temperature": 2.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "teacher_stage": 1,
+            "energy_temperature": 1.5,
+            "freeze_teacher": FREEZE_TEACHER,
         }
     }
 
