@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\B_set")
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Bset_HR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Bset_swtKD_no_featureKD_stage1_highCE_off"
+    PROJECT_NAME = "Aset_swtweight_logit_KL"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -212,7 +212,7 @@ class TRAIN:
 class KD:
     ENABLE = True
 
-    ENGINE_NAME = "swt_attention"
+    ENGINE_NAME = "swt_weight_logit"
     """
     available engines:
     segtoseg
@@ -223,6 +223,7 @@ class KD:
     swt_attention
     swt_lfa_fdd
     swt_weight_logit
+    logit_kl
     """
 
     # 모델 선택
@@ -339,12 +340,22 @@ class KD:
             "freq_hf_weight": 1.0,
         },
         "swt_weight_logit": {
+            "w_ce_student": 1.0,
+            "w_kd_logit": 0.2,
+            "w_kd_feat": 0,
+            "temperature": 2.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "teacher_stage": 1,
+            "student_stage": 1,
+            "energy_temperature": 1.5,
+            "freeze_teacher": FREEZE_TEACHER,
+            "high_ce_scale": 1.0,
+        },
+        "logit_kl": {
             "w_ce": 1.0,
             "w_kd": 0.2,
             "temperature": 2.0,
             "ignore_index": DATA.IGNORE_INDEX,
-            "teacher_stage": 1,
-            "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
         }
     }
