@@ -239,18 +239,29 @@ class SWTTunedKDEngine(BaseKDEngine):
         s_feats = tuple(s_feats)
         t_feats = tuple(t_feats)
 
-        # teacher feature에서 SWT energy / attention 추출
+        # 1) teacher / student feature 선택
         t_feat_sel = self._select_feat(t_feats, self.teacher_stage)
         s_feat_sel = self._select_feat(s_feats, self.student_stage)
         s_feat_sel = self._maybe_project_student_feat(s_feat_sel, t_feat_sel)
-        raw_energy, energy_attn = self._energy_map(t_feat_sel)
 
-        # CE: high / low attention 분리
-        ce_student, ce_low, ce_high = self._ce_with_attention(s_logits, masks, energy_attn)
+        # 2) teacher feature에서 SWT energy / attention 추출
+        raw_energy_t, energy_attn_t = self._energy_map(t_feat_sel)
 
-        # KD는 기존과 동일하게 attention 사용
-        kd_logit = self._weighted_logit_kd(s_logits, t_logits, masks, energy_attn)
-        kd_feat = self._weighted_feat_loss(s_feat_sel, t_feat_sel, energy_attn)
+        # 3) student feature에서도 SWT energy / attention 추출 (로그용)
+        #    - gradient가 굳이 필요 없다면 detach() 해서 오버헤드 줄이는 게 바람직.
+        with torch.no_grad():
+            raw_energy_s, energy_attn_s = self._energy_map(s_feat_sel.detach())
+
+        # 4) CE: high / low attention 분리 (teacher 기준 attention 사용)
+        ce_student, ce_low, ce_high = self._ce_with_attention(
+            s_logits,
+            masks,
+            energy_attn_t,
+        )
+
+        # 5) KD도 teacher 기준 attention 사용
+        kd_logit = self._weighted_logit_kd(s_logits, t_logits, masks, energy_attn_t)
+        kd_feat = self._weighted_feat_loss(s_feat_sel, t_feat_sel, energy_attn_t)
 
         total = (
             self.w_ce_student * ce_student
@@ -269,8 +280,14 @@ class SWTTunedKDEngine(BaseKDEngine):
             "t_logits": t_logits.detach(),
             "student_input": s_imgs.detach(),
             "teacher_input": t_imgs.detach(),
-            "swt_energy": raw_energy.detach(),
-            "swt_attention": energy_attn.detach(),
+
+            # === 기존 teacher 기준 SWT (이름 유지) ===
+            "swt_energy": raw_energy_t.detach(),
+            "swt_attention": energy_attn_t.detach(),
+
+            # === 추가: student 기준 SWT ===
+            "swt_energy_student": raw_energy_s.detach(),
+            "swt_attention_student": energy_attn_s.detach(),
         }
 
     def get_extra_parameters(self):

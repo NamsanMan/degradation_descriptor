@@ -36,7 +36,7 @@ else:
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Bset_swtKD_segb3_to_d3presnet50"
+    PROJECT_NAME = "Bset_swtKD_no_featureKD_stage1_highCE_off"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -135,7 +135,7 @@ class PDM:
 # ──────────────────────────────────────────────────────────────────
 
 class MODEL:
-    NAME = 'segformerb0'
+    NAME = 'segformerb3'
 
     """
     available models:
@@ -226,7 +226,7 @@ class KD:
 
     # 모델 선택
     TEACHER_NAME = 'segformerb3'
-    STUDENT_NAME = 'd3p'
+    STUDENT_NAME = 'segformerb0'
     # 이미 학습된 teacher .pth 경로 (없으면 None), KD경로는 일단 colab경로로 해놓음
 
     # 교사 고정 여부
@@ -313,14 +313,14 @@ class KD:
         "swt_attention": {
             "w_ce_student": 1.0,
             "w_kd_logit": 0.2,
-            "w_kd_feat": 0.5,
+            "w_kd_feat": 0,
             "temperature": 2.0,
             "ignore_index": DATA.IGNORE_INDEX,
             "teacher_stage": 1,
             "student_stage": 1,
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
-            "high_ce_scale": 0.3,
+            "high_ce_scale": 1.0,
         },
         "swt_lfa_fdd": {
             "w_ce_student": 1.0,

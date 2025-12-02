@@ -235,127 +235,165 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                     continue
                 writer.add_scalar(f"train/{key}", _loss_value_to_float(value), global_step)
 
+            # 한 epoch당 한 번만 이미지/히스토그램 로깅
             if batch_idx == 0:
-                swt_map  = out.get("swt_energy")
-                swt_attn = out.get("swt_attention")
+                # --- teacher / student SWT map 가져오기 ---
+                swt_map_t  = out.get("swt_energy")              # teacher
+                swt_attn_t = out.get("swt_attention")           # teacher
+                swt_map_s  = out.get("swt_energy_student")      # student
+                swt_attn_s = out.get("swt_attention_student")   # student
+
                 s_logits = out.get("s_logits")
                 band_w   = out.get("freq_band_weight")
 
-                # 1) SWT energy / attention 기본 시각화 + 히스토그램
-                if swt_map is not None:
-                    grid = vutils.make_grid(swt_map, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_energy", grid, global_step=epoch)
-                    writer.add_histogram("train/swt_energy_hist", swt_map, global_step=epoch)
+                # 1) SWT energy / attention 기본 시각화 + 히스토그램 -------------------
+                # teacher
+                if swt_map_t is not None:
+                    grid_t = vutils.make_grid(swt_map_t, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_energy_teacher", grid_t, global_step=epoch)
+                    writer.add_histogram("train/swt_energy_teacher_hist", swt_map_t, global_step=epoch)
 
-                if swt_attn is not None:
-                    grid = vutils.make_grid(swt_attn, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_attention", grid, global_step=epoch)
-                    writer.add_histogram("train/swt_attention_hist", swt_attn, global_step=epoch)
+                if swt_attn_t is not None:
+                    grid_t = vutils.make_grid(swt_attn_t, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_attention_teacher", grid_t, global_step=epoch)
+                    writer.add_histogram("train/swt_attention_teacher_hist", swt_attn_t, global_step=epoch)
 
-                    # GT boundary 생성 (bool로 처리)
-                    gt_1ch = masks.unsqueeze(1)  # (B,1,H,W), long or int
-                    gx = (gt_1ch[:, :, :, :-1] != gt_1ch[:, :, :, 1:])
-                    gy = (gt_1ch[:, :, :-1, :] != gt_1ch[:, :, 1:, :])
+                # student
+                if swt_map_s is not None:
+                    grid_s = vutils.make_grid(swt_map_s, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_energy_student", grid_s, global_step=epoch)
+                    writer.add_histogram("train/swt_energy_student_hist", swt_map_s, global_step=epoch)
 
-                    boundary = torch.zeros_like(gt_1ch, dtype=torch.bool)
+                if swt_attn_s is not None:
+                    grid_s = vutils.make_grid(swt_attn_s, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_attention_student", grid_s, global_step=epoch)
+                    writer.add_histogram("train/swt_attention_student_hist", swt_attn_s, global_step=epoch)
 
-                    boundary[:, :, :, :-1] |= gx
-                    boundary[:, :, :-1, :] |= gy
+                # 2) GT boundary 생성 -------------------------------------------------
+                #    (teacher / student 둘 다 같은 boundary 사용)
+                gt_1ch = masks.unsqueeze(1)  # (B,1,H,W), long or int
+                gx = (gt_1ch[:, :, :, :-1] != gt_1ch[:, :, :, 1:])
+                gy = (gt_1ch[:, :, :-1, :] != gt_1ch[:, :, 1:, :])
 
-                    boundary = boundary.float()  # (B,1,H,W) ← 이후 시각화/곱셈용
+                boundary = torch.zeros_like(gt_1ch, dtype=torch.bool)
+                boundary[:, :, :, :-1] |= gx
+                boundary[:, :, :-1, :] |= gy
+                boundary = boundary.float()  # (B,1,H,W)
 
-                    if boundary.shape[-2:] != swt_attn.shape[-2:]:
-                        boundary = F.interpolate(
-                            boundary, size=swt_attn.shape[-2:], mode="nearest"
-                        )
+                writer.add_image(
+                    "train/gt_boundary",
+                    vutils.make_grid(boundary, normalize=True),
+                    global_step=epoch,
+                )
+
+                # teacher attention on boundary
+                if swt_attn_t is not None:
+                    boundary_t = boundary
+                    if boundary_t.shape[-2:] != swt_attn_t.shape[-2:]:
+                        boundary_t = F.interpolate(boundary_t, size=swt_attn_t.shape[-2:], mode="nearest")
 
                     writer.add_image(
-                        "train/gt_boundary",
-                        vutils.make_grid(boundary, normalize=True),
-                        global_step=epoch,
-                    )
-                    writer.add_image(
-                        "train/swt_attention_on_boundary",
-                        vutils.make_grid(boundary * swt_attn, normalize=True, scale_each=True),
+                        "train/swt_attention_teacher_on_boundary",
+                        vutils.make_grid(boundary_t * swt_attn_t, normalize=True, scale_each=True),
                         global_step=epoch,
                     )
 
-                # 3) GT error heatmap 및 SWT 가중 error
-                if swt_attn is not None and s_logits is not None:
+                # student attention on boundary
+                if swt_attn_s is not None:
+                    boundary_s = boundary
+                    if boundary_s.shape[-2:] != swt_attn_s.shape[-2:]:
+                        boundary_s = F.interpolate(boundary_s, size=swt_attn_s.shape[-2:], mode="nearest")
+
+                    writer.add_image(
+                        "train/swt_attention_student_on_boundary",
+                        vutils.make_grid(boundary_s * swt_attn_s, normalize=True, scale_each=True),
+                        global_step=epoch,
+                    )
+
+                # 3) error heatmap 및 SWT 가중 error (teacher / student 각각) --------
+                if s_logits is not None:
                     s_pred = torch.argmax(s_logits, dim=1)  # (B,H,W)
                     gt = masks                             # (B,H,W)
 
-                    # --- A. error map for visualization (원래 코드와 동일) ---
-                    err_map = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
-
-                    if swt_attn.shape[-2:] != err_map.shape[-2:]:
-                        err_map_vis = F.interpolate(
-                            err_map, size=swt_attn.shape[-2:], mode="nearest"
-                        )
-                    else:
-                        err_map_vis = err_map
-
-                    err_attn = err_map_vis * swt_attn
-
+                    err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
                     writer.add_image(
                         "train/gt_error",
-                        vutils.make_grid(err_map_vis, normalize=True),
-                        global_step=epoch,
-                    )
-                    writer.add_image(
-                        "train/gt_error_weighted_by_swt",
-                        vutils.make_grid(err_attn, normalize=True, scale_each=True),
+                        vutils.make_grid(err_full, normalize=True),
                         global_step=epoch,
                     )
 
-                    # --- B. attention quantile별 error rate (해상도 맞춰서 계산) ---
-                    # err, attn 해상도 통일: logits / GT 해상도 기준으로 맞춤
-                    err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
-                    attn_full = swt_attn
-                    if attn_full.shape[-2:] != err_full.shape[-2:]:
-                        attn_full = F.interpolate(
-                            attn_full,
-                            size=err_full.shape[-2:],
-                            mode="bilinear",
-                            align_corners=False,
+                    # teacher 기준
+                    if swt_attn_t is not None:
+                        attn_t_full = swt_attn_t
+                        if attn_t_full.shape[-2:] != err_full.shape[-2:]:
+                            attn_t_full = F.interpolate(
+                                attn_t_full,
+                                size=err_full.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
+
+                        err_attn_t = err_full * attn_t_full
+                        writer.add_image(
+                            "train/gt_error_weighted_by_swt_teacher",
+                            vutils.make_grid(err_attn_t, normalize=True, scale_each=True),
+                            global_step=epoch,
                         )
 
-                    # (B, H*W)
-                    err_f  = err_full.view(err_full.size(0), -1)
-                    attn_f = attn_full.view(attn_full.size(0), -1)
+                        # quantile별 error (teacher attention)
+                        err_f  = err_full.view(err_full.size(0), -1)
+                        attn_f = attn_t_full.view(attn_t_full.size(0), -1)
+                        q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
+                        q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
+                        low_mask  = attn_f <= q_low
+                        high_mask = attn_f >= q_high
+                        if low_mask.any():
+                            err_low = err_f[low_mask].mean()
+                            writer.add_scalar("analysis/error_low_attention_teacher", err_low.item(), epoch)
+                        if high_mask.any():
+                            err_high = err_f[high_mask].mean()
+                            writer.add_scalar("analysis/error_high_attention_teacher", err_high.item(), epoch)
 
-                    # 배치별 quantile
-                    q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
-                    q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
+                    # student 기준
+                    if swt_attn_s is not None:
+                        attn_s_full = swt_attn_s
+                        if attn_s_full.shape[-2:] != err_full.shape[-2:]:
+                            attn_s_full = F.interpolate(
+                                attn_s_full,
+                                size=err_full.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
 
-                    low_mask  = attn_f <= q_low   # (B, H*W)
-                    high_mask = attn_f >= q_high  # (B, H*W)
-
-                    # mask가 비는 경우 방어
-                    if low_mask.any():
-                        err_low = err_f[low_mask].mean()
-                        writer.add_scalar(
-                            "analysis/error_low_attention",
-                            err_low.item(),
-                            epoch,
+                        err_attn_s = err_full * attn_s_full
+                        writer.add_image(
+                            "train/gt_error_weighted_by_swt_student",
+                            vutils.make_grid(err_attn_s, normalize=True, scale_each=True),
+                            global_step=epoch,
                         )
-                    if high_mask.any():
-                        err_high = err_f[high_mask].mean()
-                        writer.add_scalar(
-                            "analysis/error_high_attention",
-                            err_high.item(),
-                            epoch,
-                        )
 
-                # 4) Learnable frequency band weights (mean over batch)
+                        # quantile별 error (student attention)
+                        err_f  = err_full.view(err_full.size(0), -1)
+                        attn_f = attn_s_full.view(attn_s_full.size(0), -1)
+                        q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
+                        q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
+                        low_mask  = attn_f <= q_low
+                        high_mask = attn_f >= q_high
+                        if low_mask.any():
+                            err_low = err_f[low_mask].mean()
+                            writer.add_scalar("analysis/error_low_attention_student", err_low.item(), epoch)
+                        if high_mask.any():
+                            err_high = err_f[high_mask].mean()
+                            writer.add_scalar("analysis/error_high_attention_student", err_high.item(), epoch)
+
+                # 4) Learnable frequency band weights (mean over batch) --------------
                 if band_w is not None and torch.is_tensor(band_w) and band_w.numel() >= 3:
                     band_mean = band_w.detach().float().mean(dim=0)
                     writer.add_scalar("train/freq_w_LH", band_mean[0].item(), global_step)
                     writer.add_scalar("train/freq_w_HL", band_mean[1].item(), global_step)
                     writer.add_scalar("train/freq_w_HH", band_mean[2].item(), global_step)
 
-
-                # 기존 입력/예측/GT/학생-교사 불일치 시각화
+                # 기존 입력/예측/GT/학생-교사 불일치 시각화 --------------------------
                 _log_segmentation_comparison(
                     writer,
                     out,
