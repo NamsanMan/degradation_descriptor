@@ -15,6 +15,7 @@ _SOURCES = {
     "segformerb5": "nvidia/mit-b5",
 }
 
+
 class SegFormerWrapper(nn.Module):
     def __init__(self, name: str, num_classes: int = DATA.NUM_CLASSES):
         super().__init__()
@@ -26,16 +27,25 @@ class SegFormerWrapper(nn.Module):
         cfg.num_labels = num_classes
         cfg.id2label = {i: n for i, n in enumerate(DATA.CLASS_NAMES)}
         cfg.label2id = {n: i for i, n in enumerate(DATA.CLASS_NAMES)}
-        cfg.output_hidden_states = True  # 항상 stage feats 반환한다 >> KD시 필요
+        # encoder hidden states 항상 반환 (stage feature + patch embedding용)
+        cfg.output_hidden_states = True
 
         self.model = SegformerForSemanticSegmentation.from_pretrained(
             src, config=cfg, ignore_mismatched_sizes=True
         )
-        self._last_encoder_feats = None
+
+        # 마지막 forward에서 사용된 stage별 feature / embedding 저장용
+        self._last_encoder_feats = None   # Tuple[Tensor(B,C,H,W), ...] 길이 4
+        self._last_encoder_embeds = None  # Tuple[Tensor(B,N,C), ...]   길이 4
 
     # --------- 내부 유틸 ---------
     def _reshape_hidden_state(self, feat: torch.Tensor, idx: int, hw):
-        """SegFormer encoder hidden state (N, HW, C) → (N, C, H, W)."""
+        """
+        SegFormer encoder hidden state (N, HW, C) → (N, C, H, W)
+        - feat: (B, HW, C) 또는 (B, C, H, W)
+        - idx: stage index (0~3)
+        - hw: 입력 이미지 해상도 (H_in, W_in)
+        """
         if feat.dim() == 4:
             return feat
 
@@ -54,12 +64,13 @@ class SegFormerWrapper(nn.Module):
         elif strides and idx < len(strides):
             stride = strides[idx]
         else:
-            stride = 2 ** (idx + 2)  # 합리적인 fallback (4,8,16,32,...)
+            # fallback (4, 8, 16, 32, ...)
+            stride = 2 ** (idx + 2)
 
         h = max(1, math.ceil(h_in / stride))
         w = max(1, math.ceil(w_in / stride))
         if h * w != n:
-            # token 수와 맞지 않으면 가능한 정사각형 근사 사용
+            # token 수와 맞지 않으면 가능한 한 정사각형에 가깝게 reshape
             h = max(1, int(round(math.sqrt(n))))
             w = max(1, n // h)
             if h * w != n:
@@ -70,33 +81,86 @@ class SegFormerWrapper(nn.Module):
         feat = feat.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
         return feat
 
-    def _collect_encoder_feats(self, out, input_hw):
+    def _collect_encoder_feats_and_embeds(self, out, input_hw):
+        """
+        encoder hidden states에서
+          - stage 4개 raw embedding: (B, N, C) -> embeds
+          - stage 4개 feature map:  (B, C, H, W) -> feats
+        를 동시에 추출해서 저장.
+        """
         feats = getattr(out, "encoder_hidden_states", None)
         if feats is None:
             feats = getattr(out, "hidden_states", None)
         if feats is None:
-            return None
+            self._last_encoder_feats = None
+            self._last_encoder_embeds = None
+            return None, None
+
+        # hidden_states는 (B, HW, C) 또는 (B, C, H, W) 형태의 stage들이 들어있는 tuple/list
+        # SegFormer의 마지막 4개 stage만 사용
         feats = feats[-4:]
+
+        # patch embedding (B, N, C) 그대로 사용
+        embeds = tuple(f if f.dim() == 3 else f.flatten(2).transpose(1, 2) for f in feats)
+
+        # feature map (B, C, H, W)로 reshape
         reshaped = tuple(
             self._reshape_hidden_state(feat, idx, input_hw) for idx, feat in enumerate(feats)
         )
+
         self._last_encoder_feats = reshaped
-        return reshaped
+        self._last_encoder_embeds = embeds
+        return reshaped, embeds
 
     def get_last_encoder_features(self):
-        """최근 forward에서 추출한 encoder stage feature를 반환."""
+        """최근 forward에서 추출한 encoder stage feature (B,C,H,W) 튜플을 반환."""
         return self._last_encoder_feats
 
-    def forward(self, x, return_feats: bool = False):
-        # 위에서 이미 output_hidden_states=True 이므로 인자 없이 호출
+    def get_last_encoder_embeddings(self):
+        """최근 forward에서 추출한 encoder stage patch embedding (B,N,C) 튜플을 반환."""
+        return self._last_encoder_embeds
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_feats: bool = False,
+        return_embeds: bool = False,
+    ):
+        """
+        기본 동작:
+          - return_feats=False, return_embeds=False: logits만 반환 (기존과 동일)
+          - return_feats=True, return_embeds=False: (logits, feats)
+          - return_feats=True, return_embeds=True: (logits, feats, embeds)
+          - return_feats=False, return_embeds=True: (logits, embeds)
+        """
+        # HuggingFace SegFormer: output_hidden_states=True 설정되어 있음
         out = self.model(pixel_values=x, return_dict=True)
-        logits = F.interpolate(out.logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
 
-        feats = self._collect_encoder_feats(out, x.shape[-2:])
+        # decoder output (B, num_classes, H_dec, W_dec) -> 입력 해상도로 upsample
+        logits = F.interpolate(
+            out.logits,
+            size=x.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
 
-        # KD용 feature 반환 >> return_feats = True 일때 logit과 4개의 텐서로 4개의 feature map 반환
-        if return_feats:
+        feats, embeds = self._collect_encoder_feats_and_embeds(out, x.shape[-2:])
+
+        # 기존 코드와의 호환: return_feats=True만 쓰는 경우 (logits, feats) 반환
+        if not return_feats and not return_embeds:
+            return logits
+
+        if return_feats and not return_embeds:
             if feats is None:
                 raise RuntimeError("SegFormer hidden_states를 얻지 못했습니다.")
             return logits, feats
-        return logits
+
+        if not return_feats and return_embeds:
+            if embeds is None:
+                raise RuntimeError("SegFormer hidden_states를 얻지 못했습니다.")
+            return logits, embeds
+
+        # 둘 다 True 인 경우
+        if feats is None or embeds is None:
+            raise RuntimeError("SegFormer hidden_states를 얻지 못했습니다.")
+        return logits, feats, embeds

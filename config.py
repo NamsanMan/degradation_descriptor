@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_LR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Aset_swtweight_logit_KL"
+    PROJECT_NAME = "Aset_TransKD_hcl_only"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -212,7 +212,7 @@ class TRAIN:
 class KD:
     ENABLE = True
 
-    ENGINE_NAME = "swt_weight_logit"
+    ENGINE_NAME = "transkd"
     """
     available engines:
     segtoseg
@@ -224,6 +224,8 @@ class KD:
     swt_lfa_fdd
     swt_weight_logit
     logit_kl
+    swt_geometric
+    transkd
     """
 
     # 모델 선택
@@ -315,7 +317,7 @@ class KD:
         "swt_attention": {
             "w_ce_student": 1.0,
             "w_kd_logit": 0.2,
-            "w_kd_feat": 0,
+            "w_kd_feat": 0.0,
             "temperature": 2.0,
             "ignore_index": DATA.IGNORE_INDEX,
             "teacher_stage": 1,
@@ -343,18 +345,38 @@ class KD:
             "w_ce_student": 1.0,
             "w_kd_logit": 0.2,
             "w_kd_feat": 0,
-            "temperature": 2.0,
+            "temperature": 1.5,
             "ignore_index": DATA.IGNORE_INDEX,
             "teacher_stage": 1,
             "student_stage": 1,
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
-            "high_ce_scale": 1.0,
+            "high_ce_scale": 1.2,
+            "ce_energy_gamma": 3.0
         },
         "logit_kl": {
             "w_ce": 1.0,
             "w_kd": 0.2,
             "temperature": 2.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "freeze_teacher": FREEZE_TEACHER,
+        },
+        "swt_geometric": {
+            "num_classes": DATA.NUM_CLASSES,
+            "feat_dim": 128,  # 스테이지 채널 수에 맞게 조정 필요
+            "teacher_stage": 1,
+            "w_ce": 1.0,
+            "w_proto": 0.1,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "momentum": 0.999,
+            "proto_start_epoch": 3,
+            "freeze_teacher": FREEZE_TEACHER,
+        },
+        "transkd": {
+            "w_ce": 1.0,
+            "w_hcl": 1.0,
+            "w_cwd": 0.0,
+            "w_embed": 0.0,
             "ignore_index": DATA.IGNORE_INDEX,
             "freeze_teacher": FREEZE_TEACHER,
         }

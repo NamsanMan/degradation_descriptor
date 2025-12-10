@@ -202,6 +202,11 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
 # 1epoch당 학습 방법 설정 후 loss값 반환
 def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch: int = 0, global_step_start: int = 0):
     kd_engine.train()
+    if hasattr(kd_engine, "set_epoch"):
+        try:
+            kd_engine.set_epoch(epoch)
+        except Exception:
+            pass
     if not SCALAR_LOSS_KEYS:
         raise RuntimeError("No scalar losses registered from KD engine dry-run.")
     # 각 손실을 저장할 딕셔너리 초기화
@@ -238,16 +243,18 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
             # 한 epoch당 한 번만 이미지/히스토그램 로깅
             if batch_idx == 0:
                 # --- teacher / student SWT map 가져오기 ---
-                swt_map_t  = out.get("swt_energy")              # teacher
-                swt_attn_t = out.get("swt_attention")           # teacher
-                swt_map_s  = out.get("swt_energy_student")      # student
-                swt_attn_s = out.get("swt_attention_student")   # student
+                swt_map_t = out.get("swt_energy")  # teacher (fused)
+                swt_attn_t = out.get("swt_attention")  # teacher attention
+                swt_geom_t = out.get("swt_energy_geom")  # teacher geometry prior (G)
+                swt_sem_t = out.get("swt_energy_sem")  # teacher semantic prior (S)
+                swt_map_s = out.get("swt_energy_student")  # student (있으면 사용)
+                swt_attn_s = out.get("swt_attention_student")  # student (있으면 사용)
 
                 s_logits = out.get("s_logits")
                 band_w   = out.get("freq_band_weight")
 
                 # 1) SWT energy / attention 기본 시각화 + 히스토그램 -------------------
-                # teacher
+                # teacher fused energy / attention
                 if swt_map_t is not None:
                     grid_t = vutils.make_grid(swt_map_t, normalize=True, scale_each=True)
                     writer.add_image("train/swt_energy_teacher", grid_t, global_step=epoch)
@@ -257,6 +264,18 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                     grid_t = vutils.make_grid(swt_attn_t, normalize=True, scale_each=True)
                     writer.add_image("train/swt_attention_teacher", grid_t, global_step=epoch)
                     writer.add_histogram("train/swt_attention_teacher_hist", swt_attn_t, global_step=epoch)
+
+                # [추가] teacher geometry prior (shallow stages)
+                if swt_geom_t is not None:
+                    grid_g = vutils.make_grid(swt_geom_t, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_energy_geom_teacher", grid_g, global_step=epoch)
+                    writer.add_histogram("train/swt_energy_geom_teacher_hist", swt_geom_t, global_step=epoch)
+
+                # [추가] teacher semantic prior (deep stages)
+                if swt_sem_t is not None:
+                    grid_s_sem = vutils.make_grid(swt_sem_t, normalize=True, scale_each=True)
+                    writer.add_image("train/swt_energy_sem_teacher", grid_s_sem, global_step=epoch)
+                    writer.add_histogram("train/swt_energy_sem_teacher_hist", swt_sem_t, global_step=epoch)
 
                 # student
                 if swt_map_s is not None:
@@ -392,6 +411,31 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
                     writer.add_scalar("train/freq_w_LH", band_mean[0].item(), global_step)
                     writer.add_scalar("train/freq_w_HL", band_mean[1].item(), global_step)
                     writer.add_scalar("train/freq_w_HH", band_mean[2].item(), global_step)
+
+                # 5) Prototype KD 시각화 -------------------------------------------
+                proto_sim = out.get("proto_sim_map")
+                proto_wloss = out.get("proto_weighted_loss_map")
+                proto_norm_vec = out.get("proto_norm_vec")
+
+                if proto_sim is not None:
+                    writer.add_image(
+                        "train/proto_similarity_map",
+                        vutils.make_grid(proto_sim, normalize=True, scale_each=True),
+                        global_step=epoch,
+                    )
+                    writer.add_histogram("train/proto_similarity_hist", proto_sim, global_step=epoch)
+
+                if proto_wloss is not None:
+                    writer.add_image(
+                        "train/proto_weighted_loss_map",
+                        vutils.make_grid(proto_wloss, normalize=True, scale_each=True),
+                        global_step=epoch,
+                    )
+                    writer.add_histogram("train/proto_weighted_loss_hist", proto_wloss, global_step=epoch)
+
+                if proto_norm_vec is not None:
+                    writer.add_histogram("train/prototype_norms", proto_norm_vec, global_step=epoch)
+
 
                 # 기존 입력/예측/GT/학생-교사 불일치 시각화 --------------------------
                 _log_segmentation_comparison(
