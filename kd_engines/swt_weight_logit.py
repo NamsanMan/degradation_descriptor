@@ -52,7 +52,7 @@ class SWTLogitKD(BaseKDEngine):
       - w_kd_logit   = 0.2
       - w_kd_feat    = 0      → Feature KD 없음
       - teacher_stage = student_stage = 1 (동일 stage)
-      - high_ce_scale = 1.0   → CE = ce_low + ce_high
+      - high_ce_scale ≈ 1.0   → (과거 버전 호환용; 현재는 ce_energy_gamma로 대체)
     """
 
     def __init__(
@@ -68,7 +68,8 @@ class SWTLogitKD(BaseKDEngine):
         student_stage: int = 1,      # teacher_stage와 동일하다고 가정, 내부에서는 사용하지 않음
         energy_temperature: float = 1.5,
         freeze_teacher: bool = True,
-        high_ce_scale: float = 1.0,  # 항상 1.0이라고 가정
+        high_ce_scale: float = 1.0,  # 과거 버전 호환용 (지금 로스에는 직접 사용하지 않음)
+        ce_energy_gamma: float = 2.0,  # 에너지 기반 CE 가중 강도 (high_ce의 연속판)
     ) -> None:
         super().__init__(teacher, student)
         self.w_ce_student = float(w_ce_student)
@@ -79,7 +80,13 @@ class SWTLogitKD(BaseKDEngine):
         self.energy_temperature = float(energy_temperature)
         self._freeze_teacher = bool(freeze_teacher)
 
-        # 기본 CE / KL
+        # 과거 하이퍼 파라미터: 호환성 위해 저장만 함
+        self.high_ce_scale = float(high_ce_scale)
+
+        # 새로운 에너지 기반 CE 가중 강도
+        self.ce_energy_gamma = float(ce_energy_gamma)
+
+        # 기본 CE / KL (참고용; CE는 _ce_with_attention에서 직접 계산)
         self.ce_loss = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
         self.kl_loss = nn.KLDivLoss(reduction="none")
 
@@ -191,22 +198,33 @@ class SWTLogitKD(BaseKDEngine):
         s_logits: torch.Tensor,
         masks: torch.Tensor,
         energy_attn: torch.Tensor,
+        gamma: float | None = None,  # None이면 self.ce_energy_gamma 사용
     ):
         """
-        CE를 high-attention / low-attention으로 분리해서 계산.
-        이 버전에서는 high_ce_scale = 1.0 가정 → 최종 CE = ce_low + ce_high.
+        에너지 기반 연속 가중 CE.
+
+        - energy_attn: (B,1,h,w), teacher SWT 기반 attention
+        - gamma: high-attention 영역을 얼마나 더 강조할지 조절하는 스칼라
+                 (기본값: self.ce_energy_gamma)
+
+        반환:
+          ce_total: 에너지 가중 CE
+          ce_low, ce_high: 로깅용 low/high 영역 평균 CE
         """
-        # per-pixel CE: (B,H,W)
+        if gamma is None:
+            gamma = self.ce_energy_gamma
+
+        # (1) per-pixel CE: (B,H,W)
         ce_map = F.cross_entropy(
             s_logits,
             masks,
             ignore_index=self.ignore_index,
             reduction="none",
-        )  # (B,H,W)
+        )
 
         valid_mask = (masks != self.ignore_index).float().unsqueeze(1)  # (B,1,H,W)
 
-        # attention 해상도를 logits에 맞춤
+        # (2) attention 해상도 맞추기
         attn = energy_attn
         if attn.shape[-2:] != s_logits.shape[-2:]:
             attn = F.interpolate(
@@ -216,25 +234,42 @@ class SWTLogitKD(BaseKDEngine):
                 align_corners=False,
             )
 
-        # high / low attention mask (상위 20% vs 나머지)
-        attn_flat = attn.view(attn.size(0), -1)
-        q_high = torch.quantile(attn_flat, 0.8, dim=1, keepdim=True)  # (B,1)
-        high_mask = (attn_flat >= q_high).view_as(attn)               # (B,1,H,W)
-        low_mask = ~high_mask                                         # bool
+        # (3) zero-mean normalized attention (valid pixel 기준)
+        attn_valid = attn * valid_mask
+        denom_valid = valid_mask.sum(dim=[2, 3], keepdim=True).clamp(min=1.0)
+        attn_mean = attn_valid.sum(dim=[2, 3], keepdim=True) / denom_valid  # (B,1,1,1)
 
-        high_mask = high_mask.float() * valid_mask  # ignore_index 제외
-        low_mask = low_mask.float() * valid_mask
+        attn_centered = attn - attn_mean  # 평균 ≈ 0
 
+        # (4) weight = 1 + gamma * centered_attn  (음수 방지)
+        weight = 1.0 + gamma * attn_centered
+        weight = torch.clamp(weight, min=0.0)
+
+        # (5) 가중 평균 CE (에너지 가중 CE)
         ce_map = ce_map.unsqueeze(1)  # (B,1,H,W)
+        weight_valid = weight * valid_mask
+
+        denom = weight_valid.sum().clamp(min=1.0)
+        ce_total = (ce_map * weight_valid).sum() / denom
+
+        # ─────────────────────────────────────────
+        # (6) 로깅용 low/high CE 계산
+        #     - high 영역: attention 상위 20%
+        #     - low 영역: 나머지
+        # ─────────────────────────────────────────
+        attn_flat = attn.view(attn.size(0), -1)  # (B, H*W)
+        q_high = torch.quantile(attn_flat, 0.8, dim=1, keepdim=True)  # (B,1)
+
+        # (B,1,H,W) 형태로 broadcast
+        q_high_b = q_high.view(attn.size(0), 1, 1, 1)
+        high_mask = (attn >= q_high_b).float() * valid_mask
+        low_mask = (1.0 - high_mask) * valid_mask
 
         denom_low = low_mask.sum().clamp(min=1.0)
         denom_high = high_mask.sum().clamp(min=1.0)
 
         ce_low = (ce_map * low_mask).sum() / denom_low
         ce_high = (ce_map * high_mask).sum() / denom_high
-
-        # high_ce_scale = 1.0 가정 → 단순 합
-        ce_total = ce_low + ce_high
 
         return ce_total, ce_low.detach(), ce_high.detach()
 
@@ -260,7 +295,7 @@ class SWTLogitKD(BaseKDEngine):
         # 2) teacher feature에서 SWT energy / attention 추출
         raw_energy_t, energy_attn_t = self._energy_map(t_feat_sel)
 
-        # 3) CE: high / low attention 분리 (teacher 기준 attention 사용)
+        # 3) CE: energy-weighted CE + low/high 로깅 (teacher 기준 attention 사용)
         ce_student, ce_low, ce_high = self._ce_with_attention(
             s_logits,
             masks,

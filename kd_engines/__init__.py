@@ -6,6 +6,9 @@ from .gckd import GlobalContextKD
 from .swt_attention_kd import SWTTunedKDEngine
 from .swt_lfa_fdd_kd import SWTLFAFDDKDEngine
 from .swt_weight_logit import SWTLogitKD
+from .logit_kd import VanillaLogitKD
+from .swt_geometric import SWTProtoKDEngine
+from .transkd_base import TransKDBaseEngine
 
 # 사용할 수 있는 KD 엔진들을 등록
 KD_ENGINE_REGISTRY = {
@@ -17,6 +20,9 @@ KD_ENGINE_REGISTRY = {
     "swt_attention": SWTTunedKDEngine,
     "swt_lfa_fdd": SWTLFAFDDKDEngine,
     "swt_weight_logit": SWTLogitKD,
+    "logit_kl": VanillaLogitKD,
+    "swt_geometric": SWTProtoKDEngine,
+    "transkd": TransKDBaseEngine,
     # 여기에 새로운 KD 엔진(예: "attention": AttentionKD)을 추가하면 됨
 }
 

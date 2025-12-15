@@ -55,102 +55,6 @@ class CamVidDataset(Dataset):
             return (image, teacher_image), mask
         return image, mask
 
-# ──────────────────────────────────────────────────────────────────
-# 신규: PDM 변환 (원본 HR에 적용, 리사이즈 이전에 수행)
-# ──────────────────────────────────────────────────────────────────
-class PDMPatchMix:
-    def __init__(self, pdm_cfg):
-        self.enable = getattr(pdm_cfg, "ENABLE", True)
-        self.apply_prob = getattr(pdm_cfg, "APPLY_PROB", 1.0)
-
-        self.patch_size = int(getattr(pdm_cfg, "PATCH_SIZE", 4))
-        self.replace_ratio = float(getattr(pdm_cfg, "REPLACE_RATIO", 0.2))
-
-        self.d_min = float(getattr(pdm_cfg, "DOWNSCALE_MIN", 0.25))
-        self.d_max = float(getattr(pdm_cfg, "DOWNSCALE_MAX", 0.5))
-
-        self.mu = int(getattr(pdm_cfg, "GAUSS_MU", 0))
-        self.sigma_range = tuple(getattr(pdm_cfg, "GAUSS_SIGMA_RANGE", (1, 30)))
-        self.gray_prob = float(getattr(pdm_cfg, "GRAY_NOISE_PROB", 0.40))
-
-        self.down_interp = getattr(pdm_cfg, "DOWNSCALE_INTERP", "bilinear")
-        self.up_interp   = getattr(pdm_cfg, "UPSCALE_INTERP", "bilinear")
-
-    @staticmethod
-    def _to_interp(mode_str: str):
-        mode_str = (mode_str or "bilinear").lower()
-        if mode_str == "nearest":  return InterpolationMode.NEAREST
-        if mode_str == "bicubic":  return InterpolationMode.BICUBIC
-        return InterpolationMode.BILINEAR
-
-    def _add_gaussian_noise_uint8(self, arr_uint8: np.ndarray) -> np.ndarray:
-        # arr_uint8: H x W x 3, dtype=uint8
-        sigma = random.uniform(self.sigma_range[0], self.sigma_range[1])
-        if random.random() < self.gray_prob:
-            # grayscale noise 공유
-            noise = np.random.normal(self.mu, sigma, size=arr_uint8.shape[:2]).astype(np.float32)
-            noise = np.repeat(noise[:, :, None], 3, axis=2)
-        else:
-            # 채널별 독립 noise
-            noise = np.random.normal(self.mu, sigma, size=arr_uint8.shape).astype(np.float32)
-
-        out = arr_uint8.astype(np.float32) + noise
-        out = np.clip(out, 0, 255).astype(np.uint8)
-        return out
-
-    def _degrade_image(self, img_pil: Image.Image) -> Image.Image:
-        # 1) 다운스케일
-        w, h = img_pil.size
-        scale = random.uniform(self.d_min, self.d_max)
-        new_w = max(1, int(w * scale))
-        new_h = max(1, int(h * scale))
-        img_small = F.resize(img_pil, (new_h, new_w), interpolation=self._to_interp(self.down_interp))
-        # 2) 업샘플(원래 크기)
-        img_up = F.resize(img_small, (h, w), interpolation=self._to_interp(self.up_interp))
-        # 3) 가우시안 노이즈
-        arr = np.array(img_up, dtype=np.uint8)
-        arr = self._add_gaussian_noise_uint8(arr)
-        return Image.fromarray(arr)
-
-    def _apply_patch_mix(self, clean: Image.Image, degraded: Image.Image) -> Image.Image:
-        w, h = clean.size
-        ps = self.patch_size
-
-        # 패치 그리드 수
-        n_x = max(1, w // ps)
-        n_y = max(1, h // ps)
-        total_patches = n_x * n_y
-
-        k = int(round(self.replace_ratio * total_patches))
-        k = max(0, min(total_patches, k))
-        if k == 0:
-            return clean  # 교체 없음
-
-        # 교체할 패치 인덱스 샘플
-        patch_indices = random.sample(range(total_patches), k)
-
-        clean_arr = np.array(clean, dtype=np.uint8)
-        deg_arr   = np.array(degraded, dtype=np.uint8)
-
-        for idx in patch_indices:
-            py = idx // n_x
-            px = idx % n_x
-            x0 = px * ps
-            y0 = py * ps
-            x1 = min(w, x0 + ps)
-            y1 = min(h, y0 + ps)
-            clean_arr[y0:y1, x0:x1, :] = deg_arr[y0:y1, x0:x1, :]
-
-        return Image.fromarray(clean_arr)
-
-    def __call__(self, img_pil: Image.Image) -> Image.Image:
-        if (not self.enable) or (random.random() > self.apply_prob):
-            return img_pil
-        # 원본(HR) 기준: 패치 섞기 전에 전체 열화본 생성
-        degraded = self._degrade_image(img_pil)
-        mixed = self._apply_patch_mix(img_pil, degraded)
-        return mixed
-
 # train set에 대한 data augmentation: random crop, random flip, random rotation, color jitter
 class TrainAugmentation:
     def __init__(
@@ -165,7 +69,6 @@ class TrainAugmentation:
         contrast: tuple[float, float]   = (0.7, 1.2),
         saturation: tuple[float, float] = (0.9, 1.3),
         hue: tuple[float, float]        = (-0.05, 0.05),
-        pdm_transform: PDMPatchMix | None = None,  # ← 추가: 별도 클래스 주입
     ):
         self.size = size
         self.hflip_prob = hflip_prob
@@ -181,14 +84,7 @@ class TrainAugmentation:
         self.saturation = saturation
         self.hue        = hue
 
-        # 신규: 리사이즈 이전, HR에 PDM 적용
-        self.pdm = pdm_transform
-
     def __call__(self, img, mask):
-        # PDM: "패치화 이전(원본 HR)"에 적용
-        if self.pdm is not None:
-            img = self.pdm(img)
-
         # 0) 초기 리사이즈
         img  = F.resize(img,  self.size)
         mask = F.resize(mask, self.size, interpolation=InterpolationMode.NEAREST)
@@ -270,7 +166,6 @@ class JointKDTrainAugmentation:
         contrast: tuple[float, float]   = (0.7, 1.2),
         saturation: tuple[float, float] = (0.9, 1.3),
         hue: tuple[float, float]        = (-0.05, 0.05),
-        pdm_transform: PDMPatchMix | None = None,
     ):
         self.size = size
         self.hflip_prob = hflip_prob
@@ -282,7 +177,6 @@ class JointKDTrainAugmentation:
         self.contrast   = contrast
         self.saturation = saturation
         self.hue        = hue
-        self.pdm = pdm_transform
 
     def _color_jitter_student(self, img):
         jitter = T.ColorJitter(
@@ -294,10 +188,6 @@ class JointKDTrainAugmentation:
         return jitter(img)
 
     def __call__(self, img_student, mask, img_teacher=None):
-        # 학생 입력만 추가 열화 적용
-        if self.pdm is not None:
-            img_student = self.pdm(img_student)
-
         img_teacher = img_teacher if img_teacher is not None else img_student
 
         # 초기 리사이즈
@@ -354,13 +244,11 @@ _train_teacher_dir = config.DATA.TRAIN_TEACHER_IMG_DIR
 if _train_teacher_dir is not None and os.path.exists(_train_teacher_dir):
     _train_transform = JointKDTrainAugmentation(
         size=config.DATA.INPUT_RESOLUTION,
-        pdm_transform=PDMPatchMix(config.PDM)
     )
 else:
     _train_teacher_dir = None
     _train_transform = TrainAugmentation(
         size=config.DATA.INPUT_RESOLUTION,
-        pdm_transform=PDMPatchMix(config.PDM)
     )
 
 # A_set 만 B_set으로 바꿔서 2fold 진행

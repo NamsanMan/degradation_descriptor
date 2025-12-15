@@ -265,20 +265,31 @@ class SWTProtoKDEngine(BaseKDEngine):
         with torch.no_grad():
             t_logits, t_feats = self._forward_with_feats(self.teacher, teacher_in)
 
-        s_feat = self.student_proj(self._select_feat(s_feats, self.teacher_stage))
-        t_feat = self.teacher_proj(self._select_feat(t_feats, self.teacher_stage))
+        # 1. Raw Feature 추출 (수정됨)
+        raw_s_feat = self._select_feat(s_feats, self.teacher_stage)
+        raw_t_feat = self._select_feat(t_feats, self.teacher_stage)
 
-        masks_feat = self._maybe_resize_mask(masks, s_feat.shape[-2:])
+        # 2. Projector 통과 (Prototype 계산용 - 학습됨)
+        s_feat_proj = self.student_proj(raw_s_feat)
+        t_feat_proj = self.teacher_proj(raw_t_feat)
 
+        masks_feat = self._maybe_resize_mask(masks, s_feat_proj.shape[-2:])
         loss_ce = self.ce_loss_fn(s_logits, masks)
 
-        swt_energy, swt_attn = self.swt.energy_attention(t_feat)
+        # 3. [핵심 수정] SWT 입력은 Projector를 거치지 않은 'Raw HR Feature' 사용
+        #    (Raw Feature가 Projector 출력과 채널이 다를 수 있으므로 SWT 초기화 시 주의 필요)
+        #    만약 차원이 다르다면, SWT용으로 별도의 고정된 1x1 conv를 쓰거나
+        #    raw_t_feat 자체를 입력으로 써야 함. (보통 Channel-wise SWT라 상관없음)
 
+        # 여기서 raw_t_feat를 넣습니다.
+        swt_energy, swt_attn = self.swt.energy_attention(raw_t_feat)
+
+        # 4. Prototype KD 계산 (Projected Feature 사용)
         proto_out = self.proto_kd.compute_loss(
-            s_feat=s_feat,
-            t_feat=t_feat,
+            s_feat=s_feat_proj,
+            t_feat=t_feat_proj,
             mask=masks_feat,
-            swt_weight=swt_attn,
+            swt_weight=swt_attn,  # 가이드는 Raw에서 옴
         )
 
         epoch_1_based = self.current_epoch + 1

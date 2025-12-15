@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
     DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_LR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Aset_TransKD_hcl_only"
+    PROJECT_NAME = "Aset_no_PDM_test_KD"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -105,30 +105,6 @@ class DATA:
         [0, 128, 192],  # Bicyclist
         [0, 0, 0],  # Void
     ], dtype=np.uint8)
-
-# ──────────────────────────────────────────────────────────────────
-# 2-1. PDM: Patchwise Degradation Mix 설정
-# ──────────────────────────────────────────────────────────────────
-class PDM:
-    ENABLE = False          # 사용 여부
-    APPLY_PROB = 1.0       # 적용 확률 (기본 100%)
-
-    # 패치 관련
-    PATCH_SIZE = 4         # "4x4 픽셀" 패치 (요구사항)
-    REPLACE_RATIO = 0.20   # 전체 패치 중 교체 비율(0.0~1.0)
-
-    # 다운스케일 비율(원본 대비) → (0.25, 0.5)이면 25%~50%로 축소 후 재업샘플
-    DOWNSCALE_MIN = 0.25
-    DOWNSCALE_MAX = 0.25
-
-    # 가우시안 노이즈: 요구사항 고정
-    GAUSS_MU = 0
-    GAUSS_SIGMA_RANGE = (1, 30)  # 표준편차 U(1,30), 픽셀 스케일(0~255) 기준
-    GRAY_NOISE_PROB = 0.40       # Gray 40%, Color 60%
-
-    # 보간
-    DOWNSCALE_INTERP = "bilinear"  # 'nearest' | 'bilinear' | 'bicubic'
-    UPSCALE_INTERP   = "bilinear"
 
 # ──────────────────────────────────────────────────────────────────
 # 3. MODEL: 모델 설정
@@ -212,7 +188,7 @@ class TRAIN:
 class KD:
     ENABLE = True
 
-    ENGINE_NAME = "transkd"
+    ENGINE_NAME = "swt_attention"
     """
     available engines:
     segtoseg

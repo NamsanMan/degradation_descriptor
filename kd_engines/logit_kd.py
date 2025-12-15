@@ -11,7 +11,7 @@ from .base_engine import BaseKDEngine
 class VanillaLogitKD(BaseKDEngine):
     """
     Baseline logit-KD:
-      L = CE(student_logits, GT) + w_kd * KL(student || teacher)
+      L = CE(student_logits, GT) + w_kd * KL(teacher || student)
 
     - no spatial weighting
     - no feature KD
@@ -36,7 +36,8 @@ class VanillaLogitKD(BaseKDEngine):
         self.ignore_index = int(ignore_index)
 
         self.ce = nn.CrossEntropyLoss(ignore_index=self.ignore_index)
-        self.kl = nn.KLDivLoss(reduction="batchmean")
+        # 수정: reduction="none" 으로 두고, (N,C,H,W)에 대해 직접 평균
+        self.kl = nn.KLDivLoss(reduction="none")
 
         if freeze_teacher:
             for p in self.teacher.parameters():
@@ -71,11 +72,18 @@ class VanillaLogitKD(BaseKDEngine):
         # --- CE (standard) ---
         loss_ce = self.ce(s_logits, masks)
 
-        # --- logit KD (plain KL) ---
-        log_p_s = F.log_softmax(s_logits / self.temperature, dim=1)
-        p_t = F.softmax(t_logits / self.temperature, dim=1)
+        # --- logit KD: KL(teacher || student), pixel-wise 평균 ---
+        T = self.temperature
 
-        loss_kd = self.kl(log_p_s, p_t) * (self.temperature ** 2)
+        # (N,C,H,W)
+        log_p_s = F.log_softmax(s_logits / T, dim=1)
+        log_p_t = F.log_softmax(t_logits / T, dim=1)
+        p_t = log_p_t.exp()
+
+        # kl_map: (N,C,H,W), 각 위치에서 p_t * (log_p_t - log_p_s)
+        kl_map = self.kl(log_p_s, p_t)          # (N,C,H,W)
+        kl_map = kl_map.sum(dim=1)              # 채널 합산 → (N,H,W)
+        loss_kd = kl_map.mean() * (T ** 2)      # 전체 평균 + T^2 스케일링
 
         total = self.w_ce * loss_ce + self.w_kd * loss_kd
 
@@ -83,6 +91,8 @@ class VanillaLogitKD(BaseKDEngine):
             "total": total,
             "ce": loss_ce.detach(),
             "kd_logit": loss_kd.detach(),
+            "student_input": s_img.detach(),
+            "teacher_input": t_img.detach(),
             "s_logits": s_logits.detach(),
             "t_logits": t_logits.detach(),
         }
