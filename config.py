@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Bset_LR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Aset_no_PDM_test_KD"
+    PROJECT_NAME = "Bset_TransKD_re"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -188,7 +188,7 @@ class TRAIN:
 class KD:
     ENABLE = True
 
-    ENGINE_NAME = "swt_attention"
+    ENGINE_NAME = "transkd"
     """
     available engines:
     segtoseg
@@ -349,13 +349,19 @@ class KD:
             "freeze_teacher": FREEZE_TEACHER,
         },
         "transkd": {
-            "w_ce": 1.0,
-            "w_hcl": 1.0,
-            "w_cwd": 0.0,
-            "w_embed": 0.0,
-            "ignore_index": DATA.IGNORE_INDEX,
-            "freeze_teacher": FREEZE_TEACHER,
-        }
+            "knowledge_distillation_loss": "hcl",   # or "CWloss" or "KL"
+            "embed": 5,
+            "review_kd_loss_weight": 1.0,
+            "lambda_cwd": 1.0,
+            "temperature": 1.0,
+            "norm_type": "channel",
+            "divergence": "kl",
+            "embed_weights": (0.1, 0.1, 0.5, 1.0),
+
+            # 중요: CSF 채널 (기본은 TransKD 가정: B0->B2/B3)
+            "csf_in_channels":  [32, 64, 160, 256],
+            "csf_out_channels": [64, 128, 320, 512],
+        },
     }
 
     ENGINE_PARAMS = ALL_ENGINE_PARAMS[ENGINE_NAME]
