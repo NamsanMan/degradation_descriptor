@@ -117,6 +117,14 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
     for batch_idx, (imgs, masks) in enumerate(
         tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc=f"Training {epoch}")
     ):
+        # NOTE:
+        #   JointKDTrainAugmentation 이 활성화된 경우, DataLoader는
+        #   ((student_batch, teacher_batch), mask_batch) 형태를 반환한다.
+        #   기존 코드는 imgs가 Tensor라고 가정하고 .to()를 바로 호출했기 때문에
+        #   리스트/튜플이면 AttributeError가 발생했다.
+        #   → 학생 입력만 사용하되, student 텐서를 안전하게 꺼내서 GPU로 옮긴다.
+        if isinstance(imgs, (list, tuple)):
+            imgs = imgs[0]
         imgs, masks = imgs.to(device), masks.to(device)
 
         # Forward
@@ -177,6 +185,8 @@ def validate(model, loader, criterion):
     total_loss = 0.0
     with torch.no_grad():
         for imgs, masks in tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Validation"):
+            if isinstance(imgs, (list, tuple)):
+                imgs = imgs[0]
             imgs, masks = imgs.to(device), masks.to(device)
             preds = model(imgs)
             total_loss += criterion(preds, masks).item()
