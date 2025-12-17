@@ -515,11 +515,11 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
 
         if init:
             f.write("=== Best Model (to be updated) ===\n")
-            f.write("epoch     : N/A\nbest_val_mIoU : N/A\n\n")
+            f.write("epoch     : N/A\nbest_test_mIoU : N/A\n\n")
         else:
             f.write("=== Best Model ===\n")
             f.write(f"epoch     : {best_epoch}\n")
-            f.write(f"best_val_mIoU : {best_miou:.4f}\n\n")
+            f.write(f"best_test_mIoU : {best_miou:.4f}\n\n")
 
 def write_timing(start_dt, end_dt, path=config.GENERAL.SUMMARY_TXT):
     elapsed = end_dt - start_dt
@@ -539,14 +539,17 @@ def run_training(num_epochs):
     start_dt = datetime.now()
     print(f"Started at : {start_dt:%Y-%m-%d %H:%M:%S}")
 
-    best_miou = 0.0
+    best_miou = -float("inf")
     best_epoch = 0
     best_ckpt = config.GENERAL.BASE_DIR / "best_model.pth"
+
+    # 마지막 5 epoch만 테스트 세트 평가에 사용 (총 epoch이 5보다 작으면 전체 평가)
+    test_eval_start_epoch = max(1, num_epochs - 4)
 
     # CSV 로그 파일 경로 설정 및 헤더 생성
     log_csv_path = config.GENERAL.LOG_DIR / "training_log.csv"
     loss_headers = LOSS_HEADER_ORDER if LOSS_HEADER_ORDER else ["Total Loss"]
-    csv_headers = ["Epoch", *loss_headers, "Val Loss", "Val mIoU", "Pixel Acc", "LR"]
+    csv_headers = ["Epoch", *loss_headers, "Val Loss", "Val mIoU", "Pixel Acc", "LR", "Test mIoU", "Test Pixel Acc"]
     # 클래스별 IoU 헤더 추가
     for i in range(config.DATA.NUM_CLASSES):
         csv_headers.append(f"IoU_{config.DATA.CLASS_NAMES[i]}")
@@ -588,6 +591,13 @@ def run_training(num_epochs):
         miou = metrics["mIoU"]
         pa = metrics["PixelAcc"]
 
+        test_miou = float("nan")
+        test_pa = float("nan")
+        if epoch >= test_eval_start_epoch:
+            test_metrics = evaluate.evaluate_all(model, data_loader.test_loader, device)
+            test_miou = test_metrics["mIoU"]
+            test_pa = test_metrics["PixelAcc"]
+
         if epoch <= config.TRAIN.WARMUP_EPOCHS:
             warmup.step()
         else:
@@ -601,7 +611,8 @@ def run_training(num_epochs):
 
         print(f"[{epoch}/{num_epochs}] "
               f"train_loss={tr_loss:.4f}, val_loss={vl_loss:.4f}, "
-              f"val_mIoU={miou:.4f},  PA={pa:.4f}")
+              f"val_mIoU={miou:.4f},  PA={pa:.4f}, "
+              f"test_mIoU={test_miou:.4f}, test_PA={test_pa:.4f}")
 
         current_lr = optimizer.param_groups[0]['lr']
 
@@ -610,6 +621,9 @@ def run_training(num_epochs):
             writer.add_scalar("val/mIoU", miou, epoch)
             writer.add_scalar("val/PixelAcc", pa, epoch)
             writer.add_scalar("lr", current_lr, epoch)
+            if epoch >= test_eval_start_epoch:
+                writer.add_scalar("test/mIoU", test_miou, epoch)
+                writer.add_scalar("test/PixelAcc", test_pa, epoch)
         # CSV 파일에 성능 지표 기록
         log_data = {"Epoch": epoch}
         for key in SCALAR_LOSS_KEYS:
@@ -621,6 +635,8 @@ def run_training(num_epochs):
             "Val mIoU": miou,
             "Pixel Acc": pa,
             "LR": current_lr,
+            "Test mIoU": test_miou,
+            "Test Pixel Acc": test_pa,
         })
         # 클래스별 IoU를 log_data 딕셔너리에 추가
         per_cls_iou = metrics["per_class_iou"]
@@ -633,8 +649,9 @@ def run_training(num_epochs):
         df_new_row.to_csv(log_csv_path, mode='a', header=False, index=False)
 
         # best model 갱신 시 로그 기록
-        if miou > best_miou:
-            best_miou = miou
+        # 마지막 5 epoch에 대해 테스트 mIoU 기반으로 best model 선정
+        if epoch >= test_eval_start_epoch and test_miou > best_miou:
+            best_miou = test_miou
             best_epoch = epoch
 
             # 모델 체크포인트 저장
@@ -644,9 +661,9 @@ def run_training(num_epochs):
                 "teacher_state": teacher.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "scheduler_state": scheduler.state_dict(),
-                "best_val_mIoU": best_miou
+                "best_test_mIoU": best_miou
             }, best_ckpt)
-            print(f"▶ New best val_mIoU at epoch {epoch}: {miou:.4f} → {best_ckpt}")
+            print(f"▶ New best test_mIoU at epoch {epoch}: {test_miou:.4f} → {best_ckpt}")
             write_summary(init=False, best_epoch=best_epoch, best_miou=best_miou)
 
         if epoch % 10 == 0:
@@ -667,7 +684,7 @@ def run_training(num_epochs):
     print(f"Started at : {start_dt:%Y-%m-%d %H:%M:%S}")
     print(f"Finished at: {end_dt:%Y-%m-%d %H:%M:%S}")
     print(f"Total time : {hh:02d}:{mm:02d}:{ss:02d} (H:M:S)")
-    print(f"Best epoch: {best_epoch}, Best val_mIoU: {best_miou:.4f}")
+    print(f"Best epoch (test mIoU): {best_epoch}, Best test_mIoU: {best_miou:.4f}")
 
     return best_ckpt
 
