@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Dict, List
 import torchvision.utils as vutils
 from torch.utils.tensorboard import SummaryWriter
+from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
+from torch.amp import autocast, GradScaler    # ← AMP
 
 import data_loader
 import config
@@ -32,6 +34,13 @@ LOSS_KEY_DISPLAY_OVERRIDES = {
     "pca_attn": "PCA Attention Loss",
     "pca_v": "PCA Value Loss",
     "gl_loss": "GL Loss",
+    "hf_kd": "HF Feature KD Loss",
+    "warmup_alpha_hf": "HF Warmup Alpha",
+    "hf_weight_eff": "HF KD Weight (Eff)",
+    "mask_mean": "HF Mask Mean",
+    "mask_std": "HF Mask Std",
+    "mask_min": "HF Mask Min",
+    "mask_max": "HF Mask Max",
 }
 
 SCALAR_LOSS_KEYS: List[str] = []
@@ -140,8 +149,17 @@ if not config.KD.FREEZE_TEACHER and config.KD.ENGINE_PARAMS.get('w_ce_teacher', 
 optimizer_class = getattr(optim, config.TRAIN.OPTIMIZER["NAME"])
 optimizer = optimizer_class(params, **config.TRAIN.OPTIMIZER["PARAMS"])
 
-scheduler_class = getattr(optim.lr_scheduler, config.TRAIN.SCHEDULER_CALR["NAME"])
-scheduler = scheduler_class(optimizer, **config.TRAIN.SCHEDULER_CALR["PARAMS"])
+# -------------------------
+# Scheduler: Warmup(epoch) + PolyLR(iter-update)
+# -------------------------
+ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
+if ACCUM_STEPS < 1:
+    raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
+
+GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
+USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
+AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
+scaler = GradScaler(enabled=bool(USE_AMP and AMP_DEVICE_TYPE == "cuda"))
 
 # warm-up
 if config.TRAIN.USE_WARMUP:
@@ -152,6 +170,23 @@ if config.TRAIN.USE_WARMUP:
     warmup = warmup_class(optimizer, **warmup_params)
 else:
     warmup = None
+
+iters_per_epoch = len(data_loader.train_loader)
+num_epochs = int(config.TRAIN.EPOCHS)
+warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
+effective_epochs = max(num_epochs - warmup_epochs, 1)
+total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
+
+poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None)
+POLY_POWER = float(poly_params.get("power", 0.9) if poly_params else 0.9)
+POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6) if poly_params else 1e-6)
+
+poly_scheduler = PolynomialLRDecay(
+    optimizer,
+    max_decay_steps=total_optimizer_updates,
+    end_learning_rate=POLY_END_LR,
+    power=POLY_POWER,
+)
 
 def _mask_to_grid(mask_tensor: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Convert integer masks (B,H,W) to a grid for TensorBoard logging."""
@@ -171,11 +206,11 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
 
     if student_in is not None:
         grid = vutils.make_grid(student_in, normalize=True, scale_each=True)
-        writer.add_image("train/student_input", grid, global_step=epoch)
+        writer.add_image("train/student_input", grid, global_step=global_step)
 
     if teacher_in is not None:
         grid = vutils.make_grid(teacher_in, normalize=True, scale_each=True)
-        writer.add_image("train/teacher_input", grid, global_step=epoch)
+        writer.add_image("train/teacher_input", grid, global_step=global_step)
 
     if s_logits is not None:
         s_pred = torch.argmax(s_logits, dim=1)
@@ -200,97 +235,183 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
 
 
 # 1epoch당 학습 방법 설정 후 loss값 반환
-def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch: int = 0, global_step_start: int = 0):
+def train_one_epoch_kd(
+    kd_engine,
+    loader,
+    optimizer,
+    device,
+    writer=None,
+    epoch: int = 0,
+    global_step_start: int = 0,
+):
     kd_engine.train()
     if hasattr(kd_engine, "set_epoch"):
         try:
             kd_engine.set_epoch(epoch)
         except Exception:
             pass
+
     if not SCALAR_LOSS_KEYS:
         raise RuntimeError("No scalar losses registered from KD engine dry-run.")
-    # 각 손실을 저장할 딕셔너리 초기화
+
     epoch_losses = {key: 0.0 for key in SCALAR_LOSS_KEYS}
+
     pbar = tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Training")
+    optimizer.zero_grad(set_to_none=True)
+    opt_update_step = 0  # PolyLR step counter (optimizer update count within this epoch loop)
+
     for batch_idx, (imgs, masks) in enumerate(pbar):
         imgs = _move_to_device(imgs, device)
         masks = masks.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
-        out = kd_engine.compute_losses(imgs, masks, device)
-        total_loss = out.get("total")
-        if total_loss is None:
-            raise KeyError("KD engine output does not contain 'total' loss.")
-        if not isinstance(total_loss, torch.Tensor):
-            raise TypeError("'total' loss must be a torch.Tensor for backpropagation.")
-        total_loss.backward()
-        optimizer.step()
+        # AMP forward (KD engine 내부에서 teacher/student forward 포함)
+        amp_on = bool(USE_AMP and AMP_DEVICE_TYPE == "cuda")
+        with autocast(AMP_DEVICE_TYPE, enabled=amp_on):
+            out = kd_engine.compute_losses(imgs, masks, device)
+            total_loss = out.get("total")
+            if total_loss is None:
+                raise KeyError("KD engine output does not contain 'total' loss.")
+            if not isinstance(total_loss, torch.Tensor):
+                raise TypeError("'total' loss must be a torch.Tensor for backpropagation.")
 
-        # 각 손실 값을 누적
+            loss_scaled = total_loss / ACCUM_STEPS
+
+        if amp_on:
+            scaler.scale(loss_scaled).backward()
+        else:
+            loss_scaled.backward()
+
+        do_update = ((batch_idx + 1) % ACCUM_STEPS == 0) or ((batch_idx + 1) == len(loader))
+        if do_update:
+            # grad clip: AMP면 unscale 후 clip
+            if GRAD_CLIP_NORM is not None and GRAD_CLIP_NORM > 0:
+                if amp_on:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(kd_engine.parameters(), max_norm=GRAD_CLIP_NORM)
+
+            if amp_on:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
+
+            # PolyLR: warmup epoch 동안에는 step 금지
+            if (epoch > warmup_epochs) and (poly_scheduler is not None):
+                poly_scheduler.step(opt_update_step + 1)
+                opt_update_step += 1
+
+        # 누적 loss (epoch 평균용)
         for key in epoch_losses:
             value = out.get(key)
             if value is None or not _is_scalar_loss_value(value):
                 continue
             epoch_losses[key] += _loss_value_to_float(value)
+
         if writer is not None:
             global_step = global_step_start + batch_idx
+
+            # 1) scalar logging (매 step)
             for key in SCALAR_LOSS_KEYS:
                 value = out.get(key)
                 if value is None or not _is_scalar_loss_value(value):
                     continue
                 writer.add_scalar(f"train/{key}", _loss_value_to_float(value), global_step)
 
-            # 한 epoch당 한 번만 이미지/히스토그램 로깅
+            # 2) image/hist logging (epoch당 1회: batch_idx==0)
             if batch_idx == 0:
-                # --- teacher / student SWT map 가져오기 ---
-                swt_map_t = out.get("swt_energy")  # teacher (fused)
-                swt_attn_t = out.get("swt_attention")  # teacher attention
-                swt_geom_t = out.get("swt_energy_geom")  # teacher geometry prior (G)
-                swt_sem_t = out.get("swt_energy_sem")  # teacher semantic prior (S)
-                swt_map_s = out.get("swt_energy_student")  # student (있으면 사용)
-                swt_attn_s = out.get("swt_attention_student")  # student (있으면 사용)
+                def _p(k):
+                    v = out.get(k, None)
+                    if v is None:
+                        print(k, "MISSING");
+                        return
+                    if torch.is_tensor(v):
+                        if v.dim() == 0:
+                            print(k, float(v.item()))
+                        else:
+                            print(k, "shape", tuple(v.shape),
+                                  "finite", torch.isfinite(v).all().item(),
+                                  "min", float(torch.nanmin(v).item()),
+                                  "max", float(torch.nanmax(v).item()))
+                    else:
+                        print(k, v)
 
-                s_logits = out.get("s_logits")
-                band_w   = out.get("freq_band_weight")
+                for k in ["total", "ce_student", "hf_kd", "hf_kd_mag", "hf_kd_grad",
+                          "warmup_alpha_hf", "hf_weight_eff",
+                          "mask_mean", "mask_min", "mask_max",
+                          "t_hf_mean", "s_hf_mean"]:
+                    _p(k)
 
-                # 1) SWT energy / attention 기본 시각화 + 히스토그램 -------------------
-                # teacher fused energy / attention
-                if swt_map_t is not None:
-                    grid_t = vutils.make_grid(swt_map_t, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_energy_teacher", grid_t, global_step=epoch)
-                    writer.add_histogram("train/swt_energy_teacher_hist", swt_map_t, global_step=epoch)
+                def _log_map(name: str, tensor: torch.Tensor | None):
+                    if tensor is None:
+                        return
+                    t = tensor.detach()
+                    if t.dim() == 3:
+                        t = t.unsqueeze(1)  # (B,1,H,W)
+                    t = t[:4]  # 너무 많이 찍지 않기
+                    grid = vutils.make_grid(t, normalize=True, scale_each=True)
+                    writer.add_image(f"train/{name}", grid, global_step=epoch)
+                    writer.add_histogram(f"train/{name}_hist", t, global_step=epoch)
 
-                if swt_attn_t is not None:
-                    grid_t = vutils.make_grid(swt_attn_t, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_attention_teacher", grid_t, global_step=epoch)
-                    writer.add_histogram("train/swt_attention_teacher_hist", swt_attn_t, global_step=epoch)
+                # --- new engine keys (2-source attention) ---
+                b_map = out.get("logit_boundary")      # (B,1,H,W)
+                e_raw = out.get("swt_energy")          # (B,1,h,w)
+                e_imp = out.get("swt_importance")      # (B,1,h,w)
+                a_map = out.get("final_attention")     # (B,1,H,W)
 
-                # [추가] teacher geometry prior (shallow stages)
-                if swt_geom_t is not None:
-                    grid_g = vutils.make_grid(swt_geom_t, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_energy_geom_teacher", grid_g, global_step=epoch)
-                    writer.add_histogram("train/swt_energy_geom_teacher_hist", swt_geom_t, global_step=epoch)
+                _log_map("logit_boundary_probgrad", b_map)
+                _log_map("swt_energy_raw", e_raw)
+                _log_map("swt_importance", e_imp)
+                _log_map("final_attention", a_map)
 
-                # [추가] teacher semantic prior (deep stages)
-                if swt_sem_t is not None:
-                    grid_s_sem = vutils.make_grid(swt_sem_t, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_energy_sem_teacher", grid_s_sem, global_step=epoch)
-                    writer.add_histogram("train/swt_energy_sem_teacher_hist", swt_sem_t, global_step=epoch)
+                # --- NEW: SWTFPNHFFeatureKD debug keys (masked HF feature KD) ---
+                # gates
+                gate_boundary = out.get("gate_boundary")  # (B,1,H,W)
+                gate_conf = out.get("gate_conf")          # (B,1,H,W)
+                hf_mask = out.get("hf_mask")              # (B,1,H,W)
+                _log_map("gate_boundary", gate_boundary)
+                _log_map("gate_conf", gate_conf)
+                _log_map("hf_mask", hf_mask)
 
-                # student
-                if swt_map_s is not None:
-                    grid_s = vutils.make_grid(swt_map_s, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_energy_student", grid_s, global_step=epoch)
-                    writer.add_histogram("train/swt_energy_student_hist", swt_map_s, global_step=epoch)
+                # fused HF maps
+                t_hf_fpn = out.get("t_hf_fpn")            # (B,1,H,W)
+                s_hf_fpn = out.get("s_hf_fpn")            # (B,1,H,W)
+                _log_map("t_hf_fpn", t_hf_fpn)
+                _log_map("s_hf_fpn", s_hf_fpn)
+                if (t_hf_fpn is not None) and (s_hf_fpn is not None):
+                    # absolute difference heatmap (teacher vs student HF)
+                    hf_diff = (s_hf_fpn - t_hf_fpn).abs()
+                    _log_map("hf_fpn_abs_diff", hf_diff)
+                    if hf_mask is not None:
+                        # masked diff: where we actually distill
+                        if hf_mask.shape[-2:] != hf_diff.shape[-2:]:
+                            hf_mask_r = F.interpolate(hf_mask, size=hf_diff.shape[-2:], mode="bilinear", align_corners=False)
+                        else:
+                            hf_mask_r = hf_mask
+                        _log_map("hf_fpn_abs_diff_masked", hf_diff * hf_mask_r)
 
-                if swt_attn_s is not None:
-                    grid_s = vutils.make_grid(swt_attn_s, normalize=True, scale_each=True)
-                    writer.add_image("train/swt_attention_student", grid_s, global_step=epoch)
-                    writer.add_histogram("train/swt_attention_student_hist", swt_attn_s, global_step=epoch)
+                # per-stage HF maps (loop through returned keys)
+                # teacher stage keys: t_swt_hf_raw_s{idx}, t_swt_hf_imp_s{idx}
+                # student stage keys: s_swt_hf_raw_s{idx}, s_swt_hf_imp_s{idx}
+                for k in sorted(out.keys()):
+                    if k.startswith("t_swt_hf_imp_s") or k.startswith("s_swt_hf_imp_s"):
+                        _log_map(k, out.get(k))
+                    if k.startswith("t_swt_hf_raw_s") or k.startswith("s_swt_hf_raw_s"):
+                        _log_map(k, out.get(k))
 
-                # 2) GT boundary 생성 -------------------------------------------------
-                #    (teacher / student 둘 다 같은 boundary 사용)
-                gt_1ch = masks.unsqueeze(1)  # (B,1,H,W), long or int
+                # --- basic qualitative inspection: inputs / preds / GT / disagreement ---
+                _log_segmentation_comparison(
+                    writer,
+                    out,
+                    masks,
+                    epoch=epoch,
+                    global_step=global_step,
+                    num_classes=config.DATA.NUM_CLASSES,
+                )
+
+                # --- GT boundary + attention-on-boundary (optional but very useful) ---
+                gt_1ch = masks.unsqueeze(1)  # (B,1,H,W)
                 gx = (gt_1ch[:, :, :, :-1] != gt_1ch[:, :, :, 1:])
                 gy = (gt_1ch[:, :, :-1, :] != gt_1ch[:, :, 1:, :])
 
@@ -301,167 +422,93 @@ def train_one_epoch_kd(kd_engine, loader, optimizer, device, writer=None, epoch:
 
                 writer.add_image(
                     "train/gt_boundary",
-                    vutils.make_grid(boundary, normalize=True),
+                    vutils.make_grid(boundary[:4], normalize=True),
                     global_step=epoch,
                 )
 
-                # teacher attention on boundary
-                if swt_attn_t is not None:
-                    boundary_t = boundary
-                    if boundary_t.shape[-2:] != swt_attn_t.shape[-2:]:
-                        boundary_t = F.interpolate(boundary_t, size=swt_attn_t.shape[-2:], mode="nearest")
+                if a_map is not None:
+                    bnd = boundary
+                    if bnd.shape[-2:] != a_map.shape[-2:]:
+                        bnd = F.interpolate(bnd, size=a_map.shape[-2:], mode="nearest")
 
                     writer.add_image(
-                        "train/swt_attention_teacher_on_boundary",
-                        vutils.make_grid(boundary_t * swt_attn_t, normalize=True, scale_each=True),
+                        "train/final_attention_on_gt_boundary",
+                        vutils.make_grid((bnd[:4] * a_map[:4]).detach(), normalize=True, scale_each=True),
                         global_step=epoch,
                     )
 
-                # student attention on boundary
-                if swt_attn_s is not None:
-                    boundary_s = boundary
-                    if boundary_s.shape[-2:] != swt_attn_s.shape[-2:]:
-                        boundary_s = F.interpolate(boundary_s, size=swt_attn_s.shape[-2:], mode="nearest")
-
-                    writer.add_image(
-                        "train/swt_attention_student_on_boundary",
-                        vutils.make_grid(boundary_s * swt_attn_s, normalize=True, scale_each=True),
-                        global_step=epoch,
-                    )
-
-                # 3) error heatmap 및 SWT 가중 error (teacher / student 각각) --------
+                # --- error heatmap + attention-weighted error (optional) ---
+                s_logits = out.get("s_logits")
                 if s_logits is not None:
-                    s_pred = torch.argmax(s_logits, dim=1)  # (B,H,W)
-                    gt = masks                             # (B,H,W)
-
+                    s_pred = torch.argmax(s_logits, dim=1)   # (B,H,W)
+                    gt = masks                               # (B,H,W)
                     err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
+
                     writer.add_image(
                         "train/gt_error",
-                        vutils.make_grid(err_full, normalize=True),
+                        vutils.make_grid(err_full[:4], normalize=True),
                         global_step=epoch,
                     )
 
-                    # teacher 기준
-                    if swt_attn_t is not None:
-                        attn_t_full = swt_attn_t
-                        if attn_t_full.shape[-2:] != err_full.shape[-2:]:
-                            attn_t_full = F.interpolate(
-                                attn_t_full,
-                                size=err_full.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
+                    if a_map is not None:
+                        attn_full = a_map
+                        if attn_full.shape[-2:] != err_full.shape[-2:]:
+                            attn_full = F.interpolate(attn_full, size=err_full.shape[-2:], mode="bilinear", align_corners=False)
 
-                        err_attn_t = err_full * attn_t_full
+                        err_attn = err_full * attn_full
                         writer.add_image(
-                            "train/gt_error_weighted_by_swt_teacher",
-                            vutils.make_grid(err_attn_t, normalize=True, scale_each=True),
+                            "train/gt_error_weighted_by_final_attention",
+                            vutils.make_grid(err_attn[:4].detach(), normalize=True, scale_each=True),
                             global_step=epoch,
                         )
 
-                        # quantile별 error (teacher attention)
-                        err_f  = err_full.view(err_full.size(0), -1)
-                        attn_f = attn_t_full.view(attn_t_full.size(0), -1)
-                        q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
+                        # quantile error stats (low vs high attention)
+                        err_f = err_full.view(err_full.size(0), -1)
+                        attn_f = attn_full.view(attn_full.size(0), -1)
+                        q_low = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
                         q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
-                        low_mask  = attn_f <= q_low
+                        low_mask = attn_f <= q_low
                         high_mask = attn_f >= q_high
                         if low_mask.any():
-                            err_low = err_f[low_mask].mean()
-                            writer.add_scalar("analysis/error_low_attention_teacher", err_low.item(), epoch)
+                            writer.add_scalar("analysis/error_low_attention_final", err_f[low_mask].mean().item(), epoch)
                         if high_mask.any():
-                            err_high = err_f[high_mask].mean()
-                            writer.add_scalar("analysis/error_high_attention_teacher", err_high.item(), epoch)
+                            writer.add_scalar("analysis/error_high_attention_final", err_f[high_mask].mean().item(), epoch)
 
-                    # student 기준
-                    if swt_attn_s is not None:
-                        attn_s_full = swt_attn_s
-                        if attn_s_full.shape[-2:] != err_full.shape[-2:]:
-                            attn_s_full = F.interpolate(
-                                attn_s_full,
-                                size=err_full.shape[-2:],
-                                mode="bilinear",
-                                align_corners=False,
-                            )
+                # --- NEW: HF-mask driven error analysis (optional, safe if keys missing) ---
+                # Compare GT error rates in low vs high HF-mask regions (semantic edge distillation target).
+                if s_logits is not None and hf_mask is not None:
+                    s_pred = torch.argmax(s_logits, dim=1)  # (B,H,W)
+                    gt = masks
+                    err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
+                    m = hf_mask
+                    if m.shape[-2:] != err_full.shape[-2:]:
+                        m = F.interpolate(m, size=err_full.shape[-2:], mode="bilinear", align_corners=False)
+                    m_f = m.view(m.size(0), -1)
+                    err_f = err_full.view(err_full.size(0), -1)
+                    q_low = torch.quantile(m_f, 0.2, dim=1, keepdim=True)
+                    q_high = torch.quantile(m_f, 0.8, dim=1, keepdim=True)
+                    low_mask = m_f <= q_low
+                    high_mask = m_f >= q_high
+                    if low_mask.any():
+                        writer.add_scalar("analysis/error_low_hfmask", err_f[low_mask].mean().item(), epoch)
+                    if high_mask.any():
+                        writer.add_scalar("analysis/error_high_hfmask", err_f[high_mask].mean().item(), epoch)
 
-                        err_attn_s = err_full * attn_s_full
-                        writer.add_image(
-                            "train/gt_error_weighted_by_swt_student",
-                            vutils.make_grid(err_attn_s, normalize=True, scale_each=True),
-                            global_step=epoch,
-                        )
-
-                        # quantile별 error (student attention)
-                        err_f  = err_full.view(err_full.size(0), -1)
-                        attn_f = attn_s_full.view(attn_s_full.size(0), -1)
-                        q_low  = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
-                        q_high = torch.quantile(attn_f, 0.8, dim=1, keepdim=True)
-                        low_mask  = attn_f <= q_low
-                        high_mask = attn_f >= q_high
-                        if low_mask.any():
-                            err_low = err_f[low_mask].mean()
-                            writer.add_scalar("analysis/error_low_attention_student", err_low.item(), epoch)
-                        if high_mask.any():
-                            err_high = err_f[high_mask].mean()
-                            writer.add_scalar("analysis/error_high_attention_student", err_high.item(), epoch)
-
-                # 4) Learnable frequency band weights (mean over batch) --------------
-                if band_w is not None and torch.is_tensor(band_w) and band_w.numel() >= 3:
-                    band_mean = band_w.detach().float().mean(dim=0)
-                    writer.add_scalar("train/freq_w_LH", band_mean[0].item(), global_step)
-                    writer.add_scalar("train/freq_w_HL", band_mean[1].item(), global_step)
-                    writer.add_scalar("train/freq_w_HH", band_mean[2].item(), global_step)
-
-                # 5) Prototype KD 시각화 -------------------------------------------
-                proto_sim = out.get("proto_sim_map")
-                proto_wloss = out.get("proto_weighted_loss_map")
-                proto_norm_vec = out.get("proto_norm_vec")
-
-                if proto_sim is not None:
-                    writer.add_image(
-                        "train/proto_similarity_map",
-                        vutils.make_grid(proto_sim, normalize=True, scale_each=True),
-                        global_step=epoch,
-                    )
-                    writer.add_histogram("train/proto_similarity_hist", proto_sim, global_step=epoch)
-
-                if proto_wloss is not None:
-                    writer.add_image(
-                        "train/proto_weighted_loss_map",
-                        vutils.make_grid(proto_wloss, normalize=True, scale_each=True),
-                        global_step=epoch,
-                    )
-                    writer.add_histogram("train/proto_weighted_loss_hist", proto_wloss, global_step=epoch)
-
-                if proto_norm_vec is not None:
-                    writer.add_histogram("train/prototype_norms", proto_norm_vec, global_step=epoch)
-
-
-                # 기존 입력/예측/GT/학생-교사 불일치 시각화 --------------------------
-                _log_segmentation_comparison(
-                    writer,
-                    out,
-                    masks,
-                    epoch=epoch,
-                    global_step=global_step,
-                    num_classes=config.DATA.NUM_CLASSES,
-                )
-
-
+        # tqdm postfix
         postfix = {}
         for key in SCALAR_LOSS_KEYS:
             value = out.get(key)
             if value is None or not _is_scalar_loss_value(value):
                 continue
             postfix_label = LOSS_KEY_TO_HEADER.get(key, key)
-            postfix[postfix_label] = f'{_loss_value_to_float(value):.3f}'
+            postfix[postfix_label] = f"{_loss_value_to_float(value):.3f}"
         if postfix:
             pbar.set_postfix(postfix)
 
-    # 평균 손실 값 계산
     num_batches = len(loader)
     avg_losses = {key: val / num_batches for key, val in epoch_losses.items()}
     return avg_losses
+
 
 # ── (변경) 검증(학생 기준) ─────────────────────────────────
 def validate_student(student_model, loader, criterion):
@@ -495,7 +542,19 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
         f.write(f"  lr           : {og['lr']}\n")
         f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        f.write(f"Scheduler     : {scheduler.__class__.__name__}\n")
+        # Scheduler summary: Warmup(epoch) + PolyLR(iter-update)
+        if warmup is not None:
+            f.write(
+                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
+                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
+            )
+        else:
+            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
+        f.write(f"  Poly max_decay_steps : {total_optimizer_updates}\n")
+        f.write(f"  Poly power           : {POLY_POWER}\n")
+        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
+        f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
+        f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
         f.write("=== Knowledge Distillation Configuration ===\n")
         f.write(f"Engine NAME        : {config.KD.ENGINE_NAME}\n")
@@ -598,13 +657,9 @@ def run_training(num_epochs):
             test_miou = test_metrics["mIoU"]
             test_pa = test_metrics["PixelAcc"]
 
-        if epoch <= config.TRAIN.WARMUP_EPOCHS:
+        # Warmup: epoch 단위로만 step
+        if warmup is not None and epoch <= warmup_epochs:
             warmup.step()
-        else:
-            # ReduceLROnPlateau 사용시
-            #scheduler.step(vl_loss)
-            # 미사용시
-            scheduler.step()
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -660,7 +715,10 @@ def run_training(num_epochs):
                 "model_state": student.state_dict(),
                 "teacher_state": teacher.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict(),
+                "warmup_state": (warmup.state_dict() if warmup is not None else None),
+                "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
+                "use_amp": USE_AMP,
+                "accum_steps": ACCUM_STEPS,
                 "best_test_mIoU": best_miou
             }, best_ckpt)
             print(f"▶ New best test_mIoU at epoch {epoch}: {test_miou:.4f} → {best_ckpt}")
