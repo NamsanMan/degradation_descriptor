@@ -9,6 +9,9 @@ from .swt_weight_logit import SWTLogitKD
 from .logit_kd import VanillaLogitKD
 from .swt_geometric import SWTProtoKDEngine
 from .transkd_base import TransKDBaseEngine
+from .CWD import CWDEngine
+from .swt_fpn_2src_attn_logit_kd import SWTFPN2SourceAttnLogitKD
+from .swt_fpn_hf_feature_kd import SWTFPNHFFeatureKD
 
 # 사용할 수 있는 KD 엔진들을 등록
 KD_ENGINE_REGISTRY = {
@@ -23,6 +26,9 @@ KD_ENGINE_REGISTRY = {
     "logit_kl": VanillaLogitKD,
     "swt_geometric": SWTProtoKDEngine,
     "transkd": TransKDBaseEngine,
+    "cwd": CWDEngine,
+    "swt_fpn_2src_attn_logit_kd":SWTFPN2SourceAttnLogitKD,
+    "swt_fpn_hf_feature_kd": SWTFPNHFFeatureKD,
     # 여기에 새로운 KD 엔진(예: "attention": AttentionKD)을 추가하면 됨
 }
 

@@ -59,8 +59,8 @@ class SegFormerWrapper(nn.Module):
         self._register_patch_embedding_hooks()
         self.force_patch_embeds = False
 
-        def set_force_patch_embeds(self, flag: bool = True):
-            self.force_patch_embeds = bool(flag)
+    def set_force_patch_embeds(self, flag: bool = True):
+        self.force_patch_embeds = bool(flag)
 
     # --------- 내부 유틸 ---------
     def _register_patch_embedding_hooks(self):

@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from sklearn.metrics import confusion_matrix
+import torch.nn.functional as F   # ★ 추가
 
 from config import DATA
 
@@ -13,8 +14,20 @@ def evaluate_all(model, loader, device):
 
     for imgs, masks in loader:
         imgs = imgs.to(device)
-        logits = model(imgs)
-        preds = torch.argmax(logits, dim=1)
+        masks = masks.to(device)  # ★ GPU로 옮겨서 shape 맞춤에 사용 (필수는 아니지만 안전)
+
+        logits = model(imgs)  # (B,C,h,w) possibly low-res
+
+        # ★ 핵심: GT mask 해상도에 맞춰 logits 업샘플 후 argmax
+        if logits.shape[-2:] != masks.shape[-2:]:
+            logits = F.interpolate(
+                logits,
+                size=masks.shape[-2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        preds = torch.argmax(logits, dim=1)  # (B,H,W)
 
         all_preds.append(preds.cpu().numpy())
         all_masks.append(masks.cpu().numpy())
@@ -23,8 +36,7 @@ def evaluate_all(model, loader, device):
     preds_np = np.concatenate([p.flatten() for p in all_preds]).astype(np.int64)
     masks_np = np.concatenate([m.flatten() for m in all_masks]).astype(np.int64)
 
-    # 2) ★ 라벨 방어적 정규화 (테스트 라벨이 16-bit 등일 때를 대비)
-    #    [0..10] + 11(Void) 외 값은 Void로 보정
+    # 2) 라벨 방어적 정규화
     oob_true = (masks_np != DATA.IGNORE_INDEX) & (
         (masks_np < 0) | (masks_np >= DATA.NUM_CLASSES)
     )
@@ -35,7 +47,7 @@ def evaluate_all(model, loader, device):
     masks_np = masks_np[valid]
     preds_np = preds_np[valid]
 
-    # 4) ★ 예측도 안전하게 [0..10]으로 클립 (이론상 필요 없지만 방어적으로)
+    # 4) 예측 클립
     if preds_np.size > 0:
         np.clip(preds_np, 0, DATA.NUM_CLASSES - 1, out=preds_np)
 
@@ -43,7 +55,7 @@ def evaluate_all(model, loader, device):
     den = len(masks_np)
     pa = (np.sum(preds_np == masks_np) / den) if den > 0 else 0.0
 
-    # 6) Confusion Matrix (이제 안전)
+    # 6) Confusion Matrix
     cm = confusion_matrix(masks_np, preds_np, labels=list(range(DATA.NUM_CLASSES)))
 
     # 7) IoU
@@ -51,6 +63,7 @@ def evaluate_all(model, loader, device):
     union = np.sum(cm, axis=1) + np.sum(cm, axis=0) - np.diag(cm)
     iou = np.zeros(DATA.NUM_CLASSES, dtype=np.float64)
     np.divide(intersection, union, out=iou, where=(union > 0))
+
     valid_classes_iou = [iou[c] for c in range(DATA.NUM_CLASSES) if c != DATA.IGNORE_INDEX and union[c] > 0]
     miou = np.nanmean(valid_classes_iou)
 

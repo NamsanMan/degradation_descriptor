@@ -3,6 +3,7 @@ from .segformer_wrapper import SegFormerWrapper
 from .d3p import create_model as d3p
 from .model_ddrnet_23slim import DDRNet as DDRNet23Slim
 from .segformer_smp import create_segformer_smp as segformer_smp
+#from .mit import mit_b0, mit_b1, mit_b2, mit_b3, mit_b4, mit_b5
 from .unet import create_unet_model as unet
 
 # 나중에 다른 모델을 추가하면 아래에 계속 추가합니다.
@@ -26,6 +27,18 @@ def create_model(model_name: str):
     if model_name in {"segformerb0", "segformerb1", "segformerb3", "segformerb5"}:
         model = SegFormerWrapper(model_name)
         print(f"▶ Model '{[model_name]}' created.", flush=True)
+
+    elif model_name in {"mit_b0", "mit_b1", "mit_b2", "mit_b3", "mit_b4", "mit_b5"}:
+        model_map = {
+            "mit_b0": mit_b0,
+            "mit_b1": mit_b1,
+            "mit_b2": mit_b2,
+            "mit_b3": mit_b3,
+            "mit_b4": mit_b4,
+            "mit_b5": mit_b5,
+        }
+        model = model_map[model_name]()
+        print(f"▶ Model '{model_name}' created.", flush=True)
 
     elif model_name == 'd3p':
         model = d3p(classes=num_classes, use_swt=True, swt_stage_idx=2)

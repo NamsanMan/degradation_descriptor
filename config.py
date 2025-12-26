@@ -36,7 +36,7 @@ else:
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "NEWBATCHEPOCH400_Aset_TransKD"
+    PROJECT_NAME = "NEWBATCHEPOCH400_Aset_TransKD_noweightdecayonKD"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME

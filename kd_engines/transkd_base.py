@@ -89,6 +89,9 @@ class TransKDBaseEngine(BaseKDEngine):
             ignore_index=int(getattr(config.DATA, "IGNORE_INDEX", 255)),
         )
 
+        if self.params.knowledge_distillation_loss.lower() == "kl":
+            self.params.norm_type = "spatial"
+
         # ---- CSF/SKF wrap student backbone ----
         csf_in = p.get("csf_in_channels", [32, 64, 160, 256])
         csf_out = p.get("csf_out_channels", [64, 128, 320, 512])
@@ -140,6 +143,8 @@ class TransKDBaseEngine(BaseKDEngine):
 
     def compute_losses(self, imgs: Any, masks: torch.Tensor, device) -> Dict[str, Any]:
         x_s, x_t = _split_student_teacher_imgs(imgs)
+        if masks.dim() == 4 and masks.size(1) == 1:
+            masks = masks[:, 0]
 
         # --- student forward ---
         s_out = self._forward_student(x_s)
