@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
-    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\B_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
+    DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Bset_LR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_LR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "Bset_TransKD_re"
+    PROJECT_NAME = "NEWBATCHEPOCH400_Aset_TransKD"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -79,7 +79,7 @@ class DATA:
     INPUT_RESOLUTION = (360, 480)  # H, W
 
     # 배치 사이즈 및 데이터 로딩 워커 수
-    BATCH_SIZE = 4
+    BATCH_SIZE = 8
 
     # 클래스 정보
     CLASS_NAMES = [
@@ -111,7 +111,7 @@ class DATA:
 # ──────────────────────────────────────────────────────────────────
 
 class MODEL:
-    NAME = 'segformerb3'
+    NAME = 'segformerb0'
 
     """
     available models:
@@ -124,15 +124,24 @@ class MODEL:
     ddrnet23slim
     segformer_smp
     unet
+    mit_b0
+    mit_b1
+    mit_b2
+    mit_b3
+    mit_b4
+    mit_b5
     """
 
 # ──────────────────────────────────────────────────────────────────
 # 4. TRAIN: 훈련 과정 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class TRAIN:
-    EPOCHS = 150
-    USE_WARMUP = True
+    EPOCHS = 400
+    USE_WARMUP = False
     WARMUP_EPOCHS = 5
+    USE_AMP = True
+    ACCUM_STEPS = 1
+    GRAD_CLIP_NORM = 1.0
 
     # main문 실행시 checkpoint 로드할것인지 설정
     USE_CHECKPOINT = False
@@ -142,7 +151,7 @@ class TRAIN:
     OPTIMIZER = {
         "NAME": "AdamW",
         "PARAMS": {
-            "lr": 1e-4,
+            "lr": 6e-5,
             "weight_decay": 1e-2
         }
     }
@@ -157,12 +166,9 @@ class TRAIN:
         }
     }
 
-    SCHEDULER_CALR = {
-        "NAME": "CosineAnnealingLR",
-        "PARAMS": {
-            "T_max": EPOCHS - WARMUP_EPOCHS,
-            "eta_min": 1e-6
-        }
+    POLY_SCHEDULER = {
+        "power": 0.9,
+        "end_learning_rate": 1e-6
     }
 
     LOSS_FN = {
@@ -202,6 +208,9 @@ class KD:
     logit_kl
     swt_geometric
     transkd
+    cwd
+    swt_fpn_2src_attn_logit_kd
+    swt_fpn_hf_feature_kd
     """
 
     # 모델 선택
@@ -300,7 +309,7 @@ class KD:
             "student_stage": 1,
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
-            "high_ce_scale": 1.0,
+            "high_ce_scale": 1.2,
         },
         "swt_lfa_fdd": {
             "w_ce_student": 1.0,
@@ -328,7 +337,7 @@ class KD:
             "energy_temperature": 1.5,
             "freeze_teacher": FREEZE_TEACHER,
             "high_ce_scale": 1.2,
-            "ce_energy_gamma": 3.0
+            "ce_energy_gamma": 2.0
         },
         "logit_kl": {
             "w_ce": 1.0,
@@ -362,6 +371,72 @@ class KD:
             "csf_in_channels":  [32, 64, 160, 256],
             "csf_out_channels": [64, 128, 320, 512],
         },
+        "cwd": {
+            # -----------------------------
+            # Loss 구성
+            # -----------------------------
+            "w_ce_student": 1.0,  # CE(student, GT)
+            "lambda_cwd": 1.0,  # CWD feature distillation weight
+
+            # -----------------------------
+            # CWD 핵심 설정 (원본 코드 기준)
+            # -----------------------------
+            "norm_type": "channel",  # {"channel","spatial","channel_mean","none"}
+            "divergence": "kl",  # {"kl","mse"}
+            "temperature": 1.0,  # KL temperature (원본 기본값)
+
+            # -----------------------------
+            # Feature stage / channel 설정
+            # (CWD는 last stage만 사용)
+            # -----------------------------
+            # SegFormer MiT-B0 student 기준
+            "in_channels_last": 256,
+
+            # SegFormer MiT-B2 / B3 teacher 기준
+            "out_channels_last": 512,
+        },
+        "swt_fpn_2src_attn_logit_kd": {
+            "w_ce_student": 1.0,
+            "w_kd_logit": 0.2,
+            "temperature": 2.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "freeze_teacher": FREEZE_TEACHER,
+            "ce_energy_gamma": 2.0,
+            "teacher_stages": [0, 1, 2, 3],
+            "stage_weights": [1.0, 1.0, 1.0, 1.0],
+            "fpn_fuse": "sum",
+            "warmup_kd_epochs": 5,
+            "warmup_attn_epochs": 5,
+            "warmup_attn_base": "swt",
+        },
+        "swt_fpn_hf_feature_kd": {
+            "w_ce_student": 1.0,
+            "w_hf_kd": 5.0,
+            "ignore_index": DATA.IGNORE_INDEX,
+            "freeze_teacher": FREEZE_TEACHER,
+
+            "teacher_stages": [0,1,2,3],
+            "student_stages": [0,1,2,3],
+            "stage_weights": [0.2, 1.0, 1.0, 0.5],
+            "fpn_fuse": "sum",
+
+            "hf_mode": "abs_mean",
+            "use_ll": False,
+
+            "gate_mode": "boundary_conf_hf",   # boundary_conf / boundary_conf_hf 권장
+            "conf_mode": "margin",
+            "conf_temp": 1.0,
+            "gate_pow": 1.0,
+
+            "warmup_hf_epochs": 5,
+
+            "hf_loss": "l1",                   # 또는 "huber"
+            "huber_delta": 1.0,
+            "w_hf_grad": 1.5,
+            "hf_grad_mode": "sobel",
+            "huber_delta_grad": 1.0,
+        },
+
     }
 
     ENGINE_PARAMS = ALL_ENGINE_PARAMS[ENGINE_NAME]

@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Dict, List
 import torchvision.utils as vutils
 from torch.utils.tensorboard import SummaryWriter
-from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
 from torch.amp import autocast, GradScaler    # ← AMP
 
 import data_loader
@@ -149,9 +148,6 @@ if not config.KD.FREEZE_TEACHER and config.KD.ENGINE_PARAMS.get('w_ce_teacher', 
 optimizer_class = getattr(optim, config.TRAIN.OPTIMIZER["NAME"])
 optimizer = optimizer_class(params, **config.TRAIN.OPTIMIZER["PARAMS"])
 
-# -------------------------
-# Scheduler: Warmup(epoch) + PolyLR(iter-update)
-# -------------------------
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
@@ -160,33 +156,6 @@ GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
 USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
 AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 scaler = GradScaler(enabled=bool(USE_AMP and AMP_DEVICE_TYPE == "cuda"))
-
-# warm-up
-if config.TRAIN.USE_WARMUP:
-    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
-    # LinearLR의 total_iters 파라미터는 따로 계산하여 추가해줍니다.
-    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
-    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
-    warmup = warmup_class(optimizer, **warmup_params)
-else:
-    warmup = None
-
-iters_per_epoch = len(data_loader.train_loader)
-num_epochs = int(config.TRAIN.EPOCHS)
-warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
-effective_epochs = max(num_epochs - warmup_epochs, 1)
-total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
-
-poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None)
-POLY_POWER = float(poly_params.get("power", 0.9) if poly_params else 0.9)
-POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6) if poly_params else 1e-6)
-
-poly_scheduler = PolynomialLRDecay(
-    optimizer,
-    max_decay_steps=total_optimizer_updates,
-    end_learning_rate=POLY_END_LR,
-    power=POLY_POWER,
-)
 
 def _mask_to_grid(mask_tensor: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Convert integer masks (B,H,W) to a grid for TensorBoard logging."""
@@ -258,7 +227,6 @@ def train_one_epoch_kd(
 
     pbar = tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Training")
     optimizer.zero_grad(set_to_none=True)
-    opt_update_step = 0  # PolyLR step counter (optimizer update count within this epoch loop)
 
     for batch_idx, (imgs, masks) in enumerate(pbar):
         imgs = _move_to_device(imgs, device)
@@ -296,11 +264,6 @@ def train_one_epoch_kd(
                 optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
-
-            # PolyLR: warmup epoch 동안에는 step 금지
-            if (epoch > warmup_epochs) and (poly_scheduler is not None):
-                poly_scheduler.step(opt_update_step + 1)
-                opt_update_step += 1
 
         # 누적 loss (epoch 평균용)
         for key in epoch_losses:
@@ -542,17 +505,7 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
         f.write(f"  lr           : {og['lr']}\n")
         f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        # Scheduler summary: Warmup(epoch) + PolyLR(iter-update)
-        if warmup is not None:
-            f.write(
-                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
-                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
-            )
-        else:
-            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
-        f.write(f"  Poly max_decay_steps : {total_optimizer_updates}\n")
-        f.write(f"  Poly power           : {POLY_POWER}\n")
-        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
+        f.write("Scheduler     : None (fixed LR)\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
@@ -657,10 +610,6 @@ def run_training(num_epochs):
             test_miou = test_metrics["mIoU"]
             test_pa = test_metrics["PixelAcc"]
 
-        # Warmup: epoch 단위로만 step
-        if warmup is not None and epoch <= warmup_epochs:
-            warmup.step()
-
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
@@ -715,8 +664,6 @@ def run_training(num_epochs):
                 "model_state": student.state_dict(),
                 "teacher_state": teacher.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                "warmup_state": (warmup.state_dict() if warmup is not None else None),
-                "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
                 "use_amp": USE_AMP,
                 "accum_steps": ACCUM_STEPS,
                 "best_test_mIoU": best_miou

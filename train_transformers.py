@@ -14,7 +14,6 @@ from models import create_model
 import evaluate
 
 from torch.utils.tensorboard import SummaryWriter  # ← TensorBoard
-from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
 from torch.amp import autocast, GradScaler    # ← AMP
 
 # 보기 싫은 로그 숨김
@@ -38,40 +37,6 @@ optimizer = optimizer_class(model.parameters(), **config.TRAIN.OPTIMIZER["PARAMS
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
-
-# -------------------------
-# Scheduler: Warmup(epoch) + PolyLR(iter-update)
-# -------------------------
-# Warmup scheduler (epoch-based)
-if config.TRAIN.USE_WARMUP:
-    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
-    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
-    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
-    warmup = warmup_class(optimizer, **warmup_params)
-else:
-    warmup = None
-
-# NOTE: PolyLR는 optimizer.step() 횟수(max_decay_steps) 기준으로 동작함.
-#       warmup epoch 동안은 PolyLR step을 호출하지 않음.
-iters_per_epoch = len(data_loader.train_loader)
-num_epochs = int(config.TRAIN.EPOCHS)
-warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
-effective_epochs = max(num_epochs - warmup_epochs, 1)
-
-# 총 optimizer update 횟수(=scheduler step 횟수) 계산
-total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
-
-# PolyLR 파라미터
-poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None)
-POLY_POWER = float(poly_params.get("power", 0.9) if poly_params else 0.9)
-POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6) if poly_params else 1e-6)
-
-poly_scheduler = PolynomialLRDecay(
-    optimizer,
-    max_decay_steps=total_optimizer_updates,
-    end_learning_rate=POLY_END_LR,
-    power=POLY_POWER,
-)
 
 GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
 USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
@@ -143,8 +108,8 @@ def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, epoch,
                     writer=None, swt_cache=None, global_step=0,
-                    poly_scheduler=None, accum_steps: int = 1, do_poly_step: bool = True,
-                    grad_clip_norm: float = 1.0, opt_update_step: int = 0,
+                    accum_steps: int = 1,
+                    grad_clip_norm: float = 1.0,
                     scaler: GradScaler | None = None, use_amp: bool = True):
     model.train()
     total_loss = 0.0
@@ -194,11 +159,6 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            # PolyLR step: optimizer update 때만 호출
-            if do_poly_step and (poly_scheduler is not None):
-                poly_scheduler.step(opt_update_step + 1)  # 내부 last_step 업데이트
-                opt_update_step += 1
-
         total_loss += loss.item()
 
         # ─── TensorBoard logging (per-iteration) ───
@@ -237,7 +197,7 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
 
         global_step += 1
 
-    return total_loss / len(loader), global_step, opt_update_step
+    return total_loss / len(loader), global_step
 
 
 # ──────────────────────────────────
@@ -305,17 +265,7 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
         f.write(f"  lr           : {og['lr']}\n")
         f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        # Scheduler summary: Warmup(epoch) + PolyLR(iter-update)
-        if warmup is not None:
-            f.write(
-                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
-                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
-            )
-        else:
-            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
-        f.write(f"  Poly max_decay_steps : {total_optimizer_updates}\n")
-        f.write(f"  Poly power           : {POLY_POWER}\n")
-        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
+        f.write("Scheduler     : None (fixed LR)\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
@@ -374,26 +324,16 @@ def run_training(num_epochs):
 
     train_losses, val_losses = [], []
     global_step = 0
-    opt_update_step = 0  # PolyLR의 step(optimizer update count)
 
     for epoch in range(1, num_epochs + 1):
         # training
-        use_poly = True
-        do_poly_step = (epoch > warmup_epochs)  # warmup 동안에는 poly step 금지
-        tr_loss, global_step, opt_update_step = train_one_epoch(
+        tr_loss, global_step = train_one_epoch(
             model, data_loader.train_loader, criterion, optimizer, epoch,
             writer=writer, swt_cache=swt_attn_cache, global_step=global_step,
-            poly_scheduler=poly_scheduler, accum_steps=ACCUM_STEPS,
-            do_poly_step=do_poly_step, grad_clip_norm=GRAD_CLIP_NORM,
-            opt_update_step=opt_update_step,
-            scaler=scaler, use_amp=USE_AMP,
+            accum_steps=ACCUM_STEPS, grad_clip_norm=GRAD_CLIP_NORM,
         )
         # validation
         vl_loss = validate(model, data_loader.val_loader, criterion)
-
-        # Warmup scheduler: epoch 단위로만 step
-        if warmup is not None and epoch <= warmup_epochs:
-            warmup.step()
 
         # metric (mIoU, pixel acc, per-class IoU)
         metrics = evaluate.evaluate_all(model, data_loader.val_loader, device)
@@ -447,10 +387,6 @@ def run_training(num_epochs):
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                # Scheduler states: Warmup + PolyLR
-                "warmup_state": (warmup.state_dict() if warmup is not None else None),
-                "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
-                "poly_opt_update_step": opt_update_step,
                 # AMP/GA 재현을 위해 저장 (선택)
                 "use_amp": USE_AMP,
                 "accum_steps": ACCUM_STEPS,
