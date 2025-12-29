@@ -234,9 +234,20 @@ class JointKDTrainAugmentation:
         # 랜덤 회전
         if random.random() < self.rotation_prob:
             angle = random.uniform(-self.rotation_degree, self.rotation_degree)
-            img_student = F.rotate(img_student, angle, interpolation=InterpolationMode.BILINEAR)
-            img_teacher = F.rotate(img_teacher, angle, interpolation=InterpolationMode.BILINEAR)
-            mask = F.rotate(mask, angle, interpolation=InterpolationMode.NEAREST)
+            # TrainAugmentation과 동치: expand=False, mask fill=IGNORE_INDEX
+            img_student = F.rotate(
+                img_student, angle, interpolation=InterpolationMode.BILINEAR, expand=False
+            )
+            img_teacher = F.rotate(
+                img_teacher, angle, interpolation=InterpolationMode.BILINEAR, expand=False
+            )
+            mask = F.rotate(
+                mask,
+                angle,
+                interpolation=InterpolationMode.NEAREST,
+                expand=False,
+                fill=config.DATA.IGNORE_INDEX,
+            )
 
         # 공통 photometric jitter: student/teacher 동일 분포 강제
         img_student, img_teacher = self._apply_same_color_jitter(img_student, img_teacher)
