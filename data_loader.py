@@ -178,14 +178,29 @@ class JointKDTrainAugmentation:
         self.saturation = saturation
         self.hue        = hue
 
-    def _color_jitter_student(self, img):
-        jitter = T.ColorJitter(
-            brightness=self.brightness,
-            contrast=self.contrast,
-            saturation=self.saturation,
-            hue=self.hue,
-        )
-        return jitter(img)
+    def _apply_same_color_jitter(self, img_student, img_teacher):
+        """
+        Apply identical photometric jitter to student and teacher images.
+        This enforces identical input distribution for LR->LR KD.
+        """
+        b = random.uniform(*self.brightness)
+        c = random.uniform(*self.contrast)
+        s = random.uniform(*self.saturation)
+        h = random.uniform(*self.hue)
+
+        img_student = F.adjust_brightness(img_student, b)
+        img_teacher = F.adjust_brightness(img_teacher, b)
+
+        img_student = F.adjust_contrast(img_student, c)
+        img_teacher = F.adjust_contrast(img_teacher, c)
+
+        img_student = F.adjust_saturation(img_student, s)
+        img_teacher = F.adjust_saturation(img_teacher, s)
+
+        img_student = F.adjust_hue(img_student, h)
+        img_teacher = F.adjust_hue(img_teacher, h)
+
+        return img_student, img_teacher
 
     def __call__(self, img_student, mask, img_teacher=None):
         img_teacher = img_teacher if img_teacher is not None else img_student
@@ -223,8 +238,8 @@ class JointKDTrainAugmentation:
             img_teacher = F.rotate(img_teacher, angle, interpolation=InterpolationMode.BILINEAR)
             mask = F.rotate(mask, angle, interpolation=InterpolationMode.NEAREST)
 
-        # 학생만 컬러 지터로 추가 변형
-        img_student = self._color_jitter_student(img_student)
+        # 공통 photometric jitter: student/teacher 동일 분포 강제
+        img_student, img_teacher = self._apply_same_color_jitter(img_student, img_teacher)
 
         # Tensor 및 정규화
         img_student = F.to_tensor(img_student)
