@@ -86,7 +86,7 @@ class TransKDBaseEngine(BaseKDEngine):
             divergence=str(p.get("divergence", "kl")),
             temperature=float(p.get("temperature", 1.0)),
             embed_weights=tuple(p.get("embed_weights", (0.1, 0.1, 0.5, 1.0))),
-            ignore_index=int(getattr(config.DATA, "IGNORE_INDEX", 255)),
+            ignore_index=int(getattr(config.DATA, "IGNORE_INDEX", 11)),
         )
 
         if self.params.knowledge_distillation_loss.lower() == "kl":

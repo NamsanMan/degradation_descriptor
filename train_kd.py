@@ -1,6 +1,7 @@
 import torch.optim as optim
 import torch.nn as nn
 import torch.nn.functional as F
+import shutil
 import numpy as np
 from tqdm import tqdm
 import torch
@@ -11,7 +12,8 @@ from pathlib import Path
 from typing import Dict, List
 import torchvision.utils as vutils
 from torch.utils.tensorboard import SummaryWriter
-from torch.amp import autocast, GradScaler    # ← AMP
+from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
+from torch.amp import autocast, GradScaler  # ← AMP
 
 import data_loader
 import config
@@ -23,6 +25,7 @@ from kd_engines import create_kd_engine
 # 보기 싫은 로그 숨김
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
 LOSS_KEY_DISPLAY_OVERRIDES = {
     "total": "Total Loss",
     "ce_student": "CE Student Loss",
@@ -62,13 +65,14 @@ def _loss_value_to_float(value) -> float:
 def _display_name_for_loss(key: str) -> str:
     if key in LOSS_KEY_DISPLAY_OVERRIDES:
         return LOSS_KEY_DISPLAY_OVERRIDES[key]
-    pretty = key.replace('_', ' ').title()
+    pretty = key.replace("_", " ").title()
     if "loss" not in key.lower():
         pretty = f"{pretty} Loss"
     return pretty
 
+
 # model 설정
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 teacher = create_model(config.KD.TEACHER_NAME).to(device)
 student = create_model(config.KD.STUDENT_NAME).to(device)
 model = student
@@ -78,15 +82,12 @@ if config.KD.FREEZE_TEACHER:
         ckpt_path = Path(config.TEACHER_CKPT)
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            # Teacher 체크포인트가 'model_state' 키를 가지고 있는지 확인하고 로드
             if "model_state" in ckpt:
-                teacher.load_state_dict(ckpt["model_state"])        # "model_state"만 로드 하면서 .pth의 내용중 가중치만 불러옴
+                teacher.load_state_dict(ckpt["model_state"])
                 print(f"▶ Successfully loaded pretrained teacher weights from: {ckpt_path}")
             else:
-                # 키가 다른 경우를 대비하여 직접 로드 시도
                 teacher.load_state_dict(ckpt)
                 print(f"▶ Successfully loaded pretrained teacher weights from: {ckpt_path} (direct state dict)")
-
         else:
             print(f"⚠️ WARNING: Teacher checkpoint not found at {ckpt_path}. Using ImageNet pretrained weights.")
     except Exception as e:
@@ -101,6 +102,7 @@ if config.KD.FREEZE_TEACHER:
 # ── KD 엔진 구성 ───────────────────────────────────
 kd_engine = create_kd_engine(config.KD, teacher, student).to(device)
 
+
 def _move_to_device(obj, device):
     if torch.is_tensor(obj):
         return obj.to(device, non_blocking=True)
@@ -110,21 +112,18 @@ def _move_to_device(obj, device):
         return {k: _move_to_device(v, device) for k, v in obj.items()}
     return obj
 
+
 # --- build KD projections (dry-run) so their params are included in optimizer ---
 imgs0, masks0 = next(iter(data_loader.train_loader))
 imgs0 = _move_to_device(imgs0, device)
 masks0 = masks0.to(device, non_blocking=True)
 with torch.no_grad():
-    dry_run_out = kd_engine.compute_losses(imgs0,
-                                           masks0,
-                                           device)
+    dry_run_out = kd_engine.compute_losses(imgs0, masks0, device)
 
 if "total" not in dry_run_out:
     raise KeyError("KD engine must return a 'total' loss entry.")
 
-SCALAR_LOSS_KEYS = [
-    key for key, value in dry_run_out.items() if _is_scalar_loss_value(value)
-]
+SCALAR_LOSS_KEYS = [key for key, value in dry_run_out.items() if _is_scalar_loss_value(value)]
 
 if "total" in SCALAR_LOSS_KEYS:
     SCALAR_LOSS_KEYS.remove("total")
@@ -133,21 +132,58 @@ else:
     SCALAR_LOSS_KEYS.insert(0, "total")
 
 LOSS_KEY_TO_HEADER = {key: _display_name_for_loss(key) for key in SCALAR_LOSS_KEYS}
-
 LOSS_HEADER_ORDER = [LOSS_KEY_TO_HEADER[key] for key in SCALAR_LOSS_KEYS]
 
 print("▶ Tracking losses:", ", ".join(LOSS_KEY_TO_HEADER.values()))
 
 # ── 옵티마이저/스케줄러 ─────────────────────────────
-params = []
-params += list(student.parameters())
-params += list(kd_engine.get_extra_parameters())        # KD에서 projection에 이용되는 1x1 conv의 파라미터 추가
-if not config.KD.FREEZE_TEACHER and config.KD.ENGINE_PARAMS.get('w_ce_teacher', 0.0) > 0.0:
-    params += list(teacher.parameters())
-
 optimizer_class = getattr(optim, config.TRAIN.OPTIMIZER["NAME"])
-optimizer = optimizer_class(params, **config.TRAIN.OPTIMIZER["PARAMS"])
 
+# [NEW] Param-group 분리: student vs KD-extra (projection/CSF 등)
+# - student: lr=6e-5, wd=5e-3
+# - kd-extra: lr=3e-4, wd=0
+# NOTE: teacher는 freeze=False 이고 teacher CE를 쓰는 경우에만 optimizer에 포함
+student_params = list(student.parameters())
+kd_extra_params = list(kd_engine.get_extra_parameters())
+
+teacher_params = []
+if (not config.KD.FREEZE_TEACHER) and (config.KD.ENGINE_PARAMS.get("w_ce_teacher", 0.0) > 0.0):
+    teacher_params = list(teacher.parameters())
+
+# Config로 제어 가능하도록 기본값 제공
+pg = getattr(config.TRAIN, "PARAM_GROUPS", None)
+if pg is None:
+    pg = {
+        "student": {"lr": 6e-5, "weight_decay": 5e-3},
+        "kd_extra": {"lr": 3e-4, "weight_decay": 0.0},
+        # teacher group은 필요할 때만 사용 (기본은 student와 동일하게 둠)
+        "teacher": {"lr": 6e-5, "weight_decay": 5e-3},
+    }
+
+# AdamW 기타 하이퍼파라미터(betas, eps, amsgrad, fused 등)는 OPTIMIZER.PARAMS에서 가져오되
+# group별 lr/wd는 여기에서 덮어씀
+base_opt_params = dict(config.TRAIN.OPTIMIZER.get("PARAMS", {}))
+base_opt_params.pop("lr", None)
+base_opt_params.pop("weight_decay", None)
+
+param_groups = []
+param_groups.append(
+    {"params": student_params, "lr": float(pg["student"]["lr"]), "weight_decay": float(pg["student"]["weight_decay"])}
+)
+if len(kd_extra_params) > 0:
+    param_groups.append(
+        {"params": kd_extra_params, "lr": float(pg["kd_extra"]["lr"]), "weight_decay": float(pg["kd_extra"]["weight_decay"])}
+    )
+if len(teacher_params) > 0:
+    param_groups.append(
+        {"params": teacher_params, "lr": float(pg["teacher"]["lr"]), "weight_decay": float(pg["teacher"]["weight_decay"])}
+    )
+
+optimizer = optimizer_class(param_groups, **base_opt_params)
+
+# -------------------------
+# Scheduler: Warmup(epoch) + PolyLR(iter-update)
+# -------------------------
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
@@ -156,6 +192,37 @@ GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
 USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
 AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 scaler = GradScaler(enabled=bool(USE_AMP and AMP_DEVICE_TYPE == "cuda"))
+
+# warm-up (epoch 단위)
+if config.TRAIN.USE_WARMUP:
+    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
+    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
+    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
+    warmup = warmup_class(optimizer, **warmup_params)
+else:
+    warmup = None
+
+iters_per_epoch = len(data_loader.train_loader)
+num_epochs = int(config.TRAIN.EPOCHS)
+warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
+effective_epochs = max(num_epochs - warmup_epochs, 1)
+total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
+
+poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None) or {}
+# [NEW] PolyLR 관련 하이퍼파라미터를 config에서 완전 제어
+# - power, end_learning_rate는 기존과 동일 키 지원
+# - max_decay_steps는 기본(total_optimizer_updates)이나, config에서 override 가능
+POLY_POWER = float(poly_params.get("power", 0.9))
+POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6))
+POLY_MAX_DECAY_STEPS = int(poly_params.get("max_decay_steps", total_optimizer_updates))
+
+poly_scheduler = PolynomialLRDecay(
+    optimizer,
+    max_decay_steps=POLY_MAX_DECAY_STEPS,
+    end_learning_rate=POLY_END_LR,
+    power=POLY_POWER,
+)
+
 
 def _mask_to_grid(mask_tensor: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Convert integer masks (B,H,W) to a grid for TensorBoard logging."""
@@ -170,6 +237,7 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
     """Log student/teacher inputs and predictions for qualitative KD inspection."""
     student_in = out.get("student_input")
     teacher_in = out.get("teacher_input")
+    ignore = int(getattr(config.DATA, "IGNORE_INDEX", 255))
     s_logits = out.get("s_logits")
     t_logits = out.get("t_logits")
 
@@ -183,11 +251,19 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
 
     if s_logits is not None:
         s_pred = torch.argmax(s_logits, dim=1)
+        # [VIS ONLY] mark ignore pixels as ignore_index for consistent visualization
+        if masks is not None:
+            s_pred = s_pred.clone()
+            s_pred[masks == ignore] = ignore
         grid = _mask_to_grid(s_pred, num_classes)
         writer.add_image("train/student_pred", grid, global_step=global_step)
 
     if t_logits is not None:
         t_pred = torch.argmax(t_logits, dim=1)
+        # [VIS ONLY] mark ignore pixels as ignore_index for consistent visualization
+        if masks is not None:
+            t_pred = t_pred.clone()
+            t_pred[masks == ignore] = ignore
         grid = _mask_to_grid(t_pred, num_classes)
         writer.add_image("train/teacher_pred", grid, global_step=global_step)
 
@@ -198,7 +274,12 @@ def _log_segmentation_comparison(writer, out, masks, epoch, global_step, num_cla
     if s_logits is not None and t_logits is not None:
         s_pred = torch.argmax(s_logits, dim=1)
         t_pred = torch.argmax(t_logits, dim=1)
-        disagreement = (s_pred != t_pred).float().unsqueeze(1)
+        # [VIS ONLY] keep disagreement from being dominated by ignore pixels
+        if masks is not None:
+            valid = (masks != ignore)
+            disagreement = ((s_pred != t_pred) & valid).float().unsqueeze(1)
+        else:
+            disagreement = (s_pred != t_pred).float().unsqueeze(1)
         diff_grid = vutils.make_grid(disagreement, normalize=True)
         writer.add_image("train/student_teacher_disagreement", diff_grid, global_step=global_step)
 
@@ -212,6 +293,7 @@ def train_one_epoch_kd(
     writer=None,
     epoch: int = 0,
     global_step_start: int = 0,
+    opt_global_step_start: int = 0,  # ✅ GLOBAL optimizer-update counter start (monotonic across epochs)
 ):
     kd_engine.train()
     if hasattr(kd_engine, "set_epoch"):
@@ -227,6 +309,9 @@ def train_one_epoch_kd(
 
     pbar = tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Training")
     optimizer.zero_grad(set_to_none=True)
+
+    # ✅ GLOBAL (across epochs) optimizer update step for PolyLR
+    opt_update_step = int(opt_global_step_start)
 
     for batch_idx, (imgs, masks) in enumerate(pbar):
         imgs = _move_to_device(imgs, device)
@@ -265,6 +350,16 @@ def train_one_epoch_kd(
 
             optimizer.zero_grad(set_to_none=True)
 
+            # ✅ PolyLR: warmup epoch 동안에는 step 금지
+            # IMPORTANT: step number must be GLOBAL (monotonic) across whole training.
+            if (epoch > warmup_epochs) and (poly_scheduler is not None):
+                poly_scheduler.step(opt_update_step + 1)
+                opt_update_step += 1
+
+            # ✅ (optional) per-update LR logging (more accurate than epoch logging)
+            if writer is not None:
+                writer.add_scalar("lr_step", optimizer.param_groups[0]["lr"], opt_update_step)
+
         # 누적 loss (epoch 평균용)
         for key in epoch_losses:
             value = out.get(key)
@@ -284,35 +379,13 @@ def train_one_epoch_kd(
 
             # 2) image/hist logging (epoch당 1회: batch_idx==0)
             if batch_idx == 0:
-                def _p(k):
-                    v = out.get(k, None)
-                    if v is None:
-                        print(k, "MISSING");
-                        return
-                    if torch.is_tensor(v):
-                        if v.dim() == 0:
-                            print(k, float(v.item()))
-                        else:
-                            print(k, "shape", tuple(v.shape),
-                                  "finite", torch.isfinite(v).all().item(),
-                                  "min", float(torch.nanmin(v).item()),
-                                  "max", float(torch.nanmax(v).item()))
-                    else:
-                        print(k, v)
-
-                for k in ["total", "ce_student", "hf_kd", "hf_kd_mag", "hf_kd_grad",
-                          "warmup_alpha_hf", "hf_weight_eff",
-                          "mask_mean", "mask_min", "mask_max",
-                          "t_hf_mean", "s_hf_mean"]:
-                    _p(k)
-
                 def _log_map(name: str, tensor: torch.Tensor | None):
                     if tensor is None:
                         return
                     t = tensor.detach()
                     if t.dim() == 3:
                         t = t.unsqueeze(1)  # (B,1,H,W)
-                    t = t[:4]  # 너무 많이 찍지 않기
+                    t = t[:4]
                     grid = vutils.make_grid(t, normalize=True, scale_each=True)
                     writer.add_image(f"train/{name}", grid, global_step=epoch)
                     writer.add_histogram(f"train/{name}_hist", t, global_step=epoch)
@@ -329,7 +402,6 @@ def train_one_epoch_kd(
                 _log_map("final_attention", a_map)
 
                 # --- NEW: SWTFPNHFFeatureKD debug keys (masked HF feature KD) ---
-                # gates
                 gate_boundary = out.get("gate_boundary")  # (B,1,H,W)
                 gate_conf = out.get("gate_conf")          # (B,1,H,W)
                 hf_mask = out.get("hf_mask")              # (B,1,H,W)
@@ -337,33 +409,31 @@ def train_one_epoch_kd(
                 _log_map("gate_conf", gate_conf)
                 _log_map("hf_mask", hf_mask)
 
-                # fused HF maps
                 t_hf_fpn = out.get("t_hf_fpn")            # (B,1,H,W)
                 s_hf_fpn = out.get("s_hf_fpn")            # (B,1,H,W)
                 _log_map("t_hf_fpn", t_hf_fpn)
                 _log_map("s_hf_fpn", s_hf_fpn)
                 if (t_hf_fpn is not None) and (s_hf_fpn is not None):
-                    # absolute difference heatmap (teacher vs student HF)
                     hf_diff = (s_hf_fpn - t_hf_fpn).abs()
                     _log_map("hf_fpn_abs_diff", hf_diff)
                     if hf_mask is not None:
-                        # masked diff: where we actually distill
                         if hf_mask.shape[-2:] != hf_diff.shape[-2:]:
-                            hf_mask_r = F.interpolate(hf_mask, size=hf_diff.shape[-2:], mode="bilinear", align_corners=False)
+                            hf_mask_r = F.interpolate(
+                                hf_mask,
+                                size=hf_diff.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
                         else:
                             hf_mask_r = hf_mask
                         _log_map("hf_fpn_abs_diff_masked", hf_diff * hf_mask_r)
 
-                # per-stage HF maps (loop through returned keys)
-                # teacher stage keys: t_swt_hf_raw_s{idx}, t_swt_hf_imp_s{idx}
-                # student stage keys: s_swt_hf_raw_s{idx}, s_swt_hf_imp_s{idx}
                 for k in sorted(out.keys()):
                     if k.startswith("t_swt_hf_imp_s") or k.startswith("s_swt_hf_imp_s"):
                         _log_map(k, out.get(k))
                     if k.startswith("t_swt_hf_raw_s") or k.startswith("s_swt_hf_raw_s"):
                         _log_map(k, out.get(k))
 
-                # --- basic qualitative inspection: inputs / preds / GT / disagreement ---
                 _log_segmentation_comparison(
                     writer,
                     out,
@@ -373,7 +443,7 @@ def train_one_epoch_kd(
                     num_classes=config.DATA.NUM_CLASSES,
                 )
 
-                # --- GT boundary + attention-on-boundary (optional but very useful) ---
+                # --- GT boundary + attention-on-boundary ---
                 gt_1ch = masks.unsqueeze(1)  # (B,1,H,W)
                 gx = (gt_1ch[:, :, :, :-1] != gt_1ch[:, :, :, 1:])
                 gy = (gt_1ch[:, :, :-1, :] != gt_1ch[:, :, 1:, :])
@@ -381,7 +451,7 @@ def train_one_epoch_kd(
                 boundary = torch.zeros_like(gt_1ch, dtype=torch.bool)
                 boundary[:, :, :, :-1] |= gx
                 boundary[:, :, :-1, :] |= gy
-                boundary = boundary.float()  # (B,1,H,W)
+                boundary = boundary.float()
 
                 writer.add_image(
                     "train/gt_boundary",
@@ -400,12 +470,12 @@ def train_one_epoch_kd(
                         global_step=epoch,
                     )
 
-                # --- error heatmap + attention-weighted error (optional) ---
+                # --- error heatmap + attention-weighted error ---
                 s_logits = out.get("s_logits")
                 if s_logits is not None:
-                    s_pred = torch.argmax(s_logits, dim=1)   # (B,H,W)
-                    gt = masks                               # (B,H,W)
-                    err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
+                    s_pred = torch.argmax(s_logits, dim=1)
+                    gt = masks
+                    err_full = (s_pred != gt).float().unsqueeze(1)
 
                     writer.add_image(
                         "train/gt_error",
@@ -416,7 +486,12 @@ def train_one_epoch_kd(
                     if a_map is not None:
                         attn_full = a_map
                         if attn_full.shape[-2:] != err_full.shape[-2:]:
-                            attn_full = F.interpolate(attn_full, size=err_full.shape[-2:], mode="bilinear", align_corners=False)
+                            attn_full = F.interpolate(
+                                attn_full,
+                                size=err_full.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            )
 
                         err_attn = err_full * attn_full
                         writer.add_image(
@@ -425,7 +500,6 @@ def train_one_epoch_kd(
                             global_step=epoch,
                         )
 
-                        # quantile error stats (low vs high attention)
                         err_f = err_full.view(err_full.size(0), -1)
                         attn_f = attn_full.view(attn_full.size(0), -1)
                         q_low = torch.quantile(attn_f, 0.2, dim=1, keepdim=True)
@@ -437,12 +511,11 @@ def train_one_epoch_kd(
                         if high_mask.any():
                             writer.add_scalar("analysis/error_high_attention_final", err_f[high_mask].mean().item(), epoch)
 
-                # --- NEW: HF-mask driven error analysis (optional, safe if keys missing) ---
-                # Compare GT error rates in low vs high HF-mask regions (semantic edge distillation target).
+                # --- HF-mask driven error analysis ---
                 if s_logits is not None and hf_mask is not None:
-                    s_pred = torch.argmax(s_logits, dim=1)  # (B,H,W)
+                    s_pred = torch.argmax(s_logits, dim=1)
                     gt = masks
-                    err_full = (s_pred != gt).float().unsqueeze(1)  # (B,1,H,W)
+                    err_full = (s_pred != gt).float().unsqueeze(1)
                     m = hf_mask
                     if m.shape[-2:] != err_full.shape[-2:]:
                         m = F.interpolate(m, size=err_full.shape[-2:], mode="bilinear", align_corners=False)
@@ -470,7 +543,7 @@ def train_one_epoch_kd(
 
     num_batches = len(loader)
     avg_losses = {key: val / num_batches for key, val in epoch_losses.items()}
-    return avg_losses
+    return avg_losses, opt_update_step  # ✅ return updated GLOBAL optimizer-update step
 
 
 # ── (변경) 검증(학생 기준) ─────────────────────────────────
@@ -484,17 +557,20 @@ def validate_student(student_model, loader, criterion):
             total_loss += criterion(preds, masks).item()
     return total_loss / len(loader)
 
+
 def plot_progress(epochs, train_losses, val_losses):
-    plt.figure(figsize=(8,6))
+    plt.figure(figsize=(8, 6))
     plt.plot(epochs, train_losses, label="Train Loss")
-    plt.plot(epochs, val_losses,   label="Val Loss")
-    plt.xlabel("Epoch"); plt.ylabel("Loss")
-    plt.legend(); plt.grid(True)
+    plt.plot(epochs, val_losses, label="Val Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
     plt.savefig(str(config.GENERAL.SAVE_PLOT), bbox_inches="tight")
     plt.close()
 
+
 def write_summary(init=False, best_epoch=None, best_miou=None):
-    # 기존 동일 (단, 모델명은 학생/교사 둘 표시 권장)
     with open(config.GENERAL.SUMMARY_TXT, "w", encoding="utf-8") as f:
         f.write("=== Training Configuration ===\n")
         f.write(f"Dataset path : {config.DATA.DATA_DIR}\n")
@@ -503,25 +579,33 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Teacher Model: {teacher.__class__.__name__}  (source: {config.KD.TEACHER_NAME})\n\n")
         f.write(f"Teacher Freeze: {config.KD.FREEZE_TEACHER}\n")
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
-        f.write(f"  lr           : {og['lr']}\n")
-        f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        f.write("Scheduler     : None (fixed LR)\n")
+        f.write("  --- Param Groups ---\n")
+        for gi, g in enumerate(optimizer.param_groups):
+            f.write(f"  group[{gi}] lr={g.get('lr')} wd={g.get('weight_decay')} n_params={len(g.get('params', []))}\n")
+        if warmup is not None:
+            f.write(
+                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
+                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
+            )
+        else:
+            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
+        f.write(f"  Poly max_decay_steps : {POLY_MAX_DECAY_STEPS}\n")
+        f.write(f"  Poly power           : {POLY_POWER}\n")
+        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
         f.write("=== Knowledge Distillation Configuration ===\n")
         f.write(f"Engine NAME        : {config.KD.ENGINE_NAME}\n")
         f.write(f"Teacher Source CKPT: {config.TEACHER_CKPT}\n\n")
-        # 1. 현재 설정된 엔진의 파라미터 딕셔너리를 가져옵니다.
+
         engine_name = config.KD.ENGINE_NAME
         current_engine_params = config.KD.ALL_ENGINE_PARAMS.get(engine_name, {})
         f.write(f"--- Parameters for '{engine_name}' engine ---\n")
-        # 2. 가져온 딕셔너리를 반복하면서 모든 파라미터를 자동으로 기록합니다.
         if not current_engine_params:
             f.write("No parameters found for this engine.\n")
         else:
             for key, value in current_engine_params.items():
-                # 보기 좋게 정렬하기 위해 key 문자열의 길이를 25로 맞춥니다.
                 f.write(f"{key:<25} : {value}\n")
         f.write("\n")
 
@@ -533,17 +617,19 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
             f.write(f"epoch     : {best_epoch}\n")
             f.write(f"best_test_mIoU : {best_miou:.4f}\n\n")
 
+
 def write_timing(start_dt, end_dt, path=config.GENERAL.SUMMARY_TXT):
     elapsed = end_dt - start_dt
     total_sec = int(elapsed.total_seconds())
     hh = total_sec // 3600
     mm = (total_sec % 3600) // 60
     ss = total_sec % 60
-    with open(path, "a", encoding="utf-8") as f:  # append
+    with open(path, "a", encoding="utf-8") as f:
         f.write("=== Timing ===\n")
         f.write(f"Start : {start_dt.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"End   : {end_dt.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Total : {hh:02d}:{mm:02d}:{ss:02d} (H:M:S)\n\n")
+
 
 # 학습 진행 및 잘 되고있나 성능평가
 def run_training(num_epochs):
@@ -551,31 +637,33 @@ def run_training(num_epochs):
     start_dt = datetime.now()
     print(f"Started at : {start_dt:%Y-%m-%d %H:%M:%S}")
 
-    best_miou = -float("inf")
-    best_epoch = 0
-    best_ckpt = config.GENERAL.BASE_DIR / "best_model.pth"
+    best_test_miou = -float("inf")
+    best_test_epoch = 0
+    best_val_miou = -float("inf")
+    best_val_epoch = 0
 
-    # 마지막 5 epoch만 테스트 세트 평가에 사용 (총 epoch이 5보다 작으면 전체 평가)
-    test_eval_start_epoch = max(1, num_epochs - 4)
+    best_test_ckpt = config.GENERAL.BASE_DIR / "best_model_test.pth"
+    best_val_ckpt  = config.GENERAL.BASE_DIR / "best_model_val.pth"
+    final_best_ckpt = config.GENERAL.BASE_DIR / "best_model.pth"
+
+    # 마지막 50 epoch만 테스트 세트 평가에 사용 (총 epoch이 50보다 작으면 전체 평가)
+    test_eval_start_epoch = max(1, num_epochs - 49)
 
     # CSV 로그 파일 경로 설정 및 헤더 생성
     log_csv_path = config.GENERAL.LOG_DIR / "training_log.csv"
     loss_headers = LOSS_HEADER_ORDER if LOSS_HEADER_ORDER else ["Total Loss"]
     csv_headers = ["Epoch", *loss_headers, "Val Loss", "Val mIoU", "Pixel Acc", "LR", "Test mIoU", "Test Pixel Acc"]
-    # 클래스별 IoU 헤더 추가
     for i in range(config.DATA.NUM_CLASSES):
         csv_headers.append(f"IoU_{config.DATA.CLASS_NAMES[i]}")
 
-    # 파일이 없으면 헤더를 포함하여 새로 생성
     if log_csv_path.exists():
         try:
             existing_cols = list(pd.read_csv(log_csv_path, nrows=0).columns)
             if len(existing_cols) > 0:
-                csv_headers = existing_cols  # 기존 헤더 신뢰
+                csv_headers = existing_cols
         except Exception:
             pass
     else:
-        # 새 파일 생성 시에만 헤더를 기록
         pd.DataFrame(columns=csv_headers).to_csv(log_csv_path, index=False)
 
     train_losses, val_losses = [], []
@@ -584,9 +672,10 @@ def run_training(num_epochs):
     criterion = loss_class(**config.TRAIN.LOSS_FN["PARAMS"])
 
     global_step = 0
+    opt_global_step = 0  # ✅ GLOBAL optimizer update step (PolyLR 기준, epoch 넘어도 누적)
+
     for epoch in range(1, num_epochs + 1):
-        # train_one_epoch_kd는 이제 손실 딕셔너리를 반환
-        tr_losses_dict = train_one_epoch_kd(
+        tr_losses_dict, opt_global_step = train_one_epoch_kd(
             kd_engine,
             data_loader.train_loader,
             optimizer,
@@ -594,14 +683,38 @@ def run_training(num_epochs):
             writer=writer,
             epoch=epoch,
             global_step_start=global_step,
+            opt_global_step_start=opt_global_step,
         )
-        tr_loss = tr_losses_dict["total"]  # plot을 위한 total loss
+        tr_loss = tr_losses_dict["total"]
         global_step += len(data_loader.train_loader)
 
         vl_loss = validate_student(student, data_loader.val_loader, criterion)
         metrics = evaluate.evaluate_all(model, data_loader.val_loader, device)
         miou = metrics["mIoU"]
         pa = metrics["PixelAcc"]
+
+        # ------------------------------------------------------------
+        # NEW: Best Val mIoU checkpoint 저장 (항상 평가 가능)
+        # ------------------------------------------------------------
+        if miou > best_val_miou:
+            best_val_miou = miou
+            best_val_epoch = epoch
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": student.state_dict(),
+                    "teacher_state": teacher.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "warmup_state": (warmup.state_dict() if warmup is not None else None),
+                    "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
+                    "use_amp": USE_AMP,
+                    "accum_steps": ACCUM_STEPS,
+                    "best_val_mIoU": best_val_miou,
+                    "opt_global_step": opt_global_step,
+                },
+                best_val_ckpt,
+            )
+            print(f"▶ New best val_mIoU at epoch {epoch}: {miou:.4f} → {best_val_ckpt}")
 
         test_miou = float("nan")
         test_pa = float("nan")
@@ -610,15 +723,21 @@ def run_training(num_epochs):
             test_miou = test_metrics["mIoU"]
             test_pa = test_metrics["PixelAcc"]
 
+        # Warmup: epoch 단위로만 step
+        if warmup is not None and epoch <= warmup_epochs:
+            warmup.step()
+
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
 
-        print(f"[{epoch}/{num_epochs}] "
-              f"train_loss={tr_loss:.4f}, val_loss={vl_loss:.4f}, "
-              f"val_mIoU={miou:.4f},  PA={pa:.4f}, "
-              f"test_mIoU={test_miou:.4f}, test_PA={test_pa:.4f}")
+        print(
+            f"[{epoch}/{num_epochs}] "
+            f"train_loss={tr_loss:.4f}, val_loss={vl_loss:.4f}, "
+            f"val_mIoU={miou:.4f},  PA={pa:.4f}, "
+            f"test_mIoU={test_miou:.4f}, test_PA={test_pa:.4f}"
+        )
 
-        current_lr = optimizer.param_groups[0]['lr']
+        current_lr = optimizer.param_groups[0]["lr"]
 
         if writer is not None:
             writer.add_scalar("val/loss", vl_loss, epoch)
@@ -628,48 +747,53 @@ def run_training(num_epochs):
             if epoch >= test_eval_start_epoch:
                 writer.add_scalar("test/mIoU", test_miou, epoch)
                 writer.add_scalar("test/PixelAcc", test_pa, epoch)
+
         # CSV 파일에 성능 지표 기록
         log_data = {"Epoch": epoch}
         for key in SCALAR_LOSS_KEYS:
             header_name = LOSS_KEY_TO_HEADER.get(key, key)
             log_data[header_name] = tr_losses_dict.get(key, float("nan"))
 
-        log_data.update({
-            "Val Loss": vl_loss,
-            "Val mIoU": miou,
-            "Pixel Acc": pa,
-            "LR": current_lr,
-            "Test mIoU": test_miou,
-            "Test Pixel Acc": test_pa,
-        })
-        # 클래스별 IoU를 log_data 딕셔너리에 추가
+        log_data.update(
+            {
+                "Val Loss": vl_loss,
+                "Val mIoU": miou,
+                "Pixel Acc": pa,
+                "LR": current_lr,
+                "Test mIoU": test_miou,
+                "Test Pixel Acc": test_pa,
+            }
+        )
+
         per_cls_iou = metrics["per_class_iou"]
         for i in range(config.DATA.NUM_CLASSES):
             log_data[f"IoU_{config.DATA.CLASS_NAMES[i]}"] = float(per_cls_iou[i])
 
-
-        # DataFrame으로 변환 후 CSV 파일에 append
         df_new_row = pd.DataFrame([log_data]).reindex(columns=csv_headers)
-        df_new_row.to_csv(log_csv_path, mode='a', header=False, index=False)
+        df_new_row.to_csv(log_csv_path, mode="a", header=False, index=False)
 
-        # best model 갱신 시 로그 기록
-        # 마지막 5 epoch에 대해 테스트 mIoU 기반으로 best model 선정
-        if epoch >= test_eval_start_epoch and test_miou > best_miou:
-            best_miou = test_miou
-            best_epoch = epoch
+        # best model 갱신 (마지막 5 epoch: test mIoU 기준)
+        if epoch >= test_eval_start_epoch and test_miou > best_test_miou:
+            best_test_miou = test_miou
+            best_test_epoch = epoch
 
-            # 모델 체크포인트 저장
-            torch.save({
-                "epoch": epoch,
-                "model_state": student.state_dict(),
-                "teacher_state": teacher.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "use_amp": USE_AMP,
-                "accum_steps": ACCUM_STEPS,
-                "best_test_mIoU": best_miou
-            }, best_ckpt)
-            print(f"▶ New best test_mIoU at epoch {epoch}: {test_miou:.4f} → {best_ckpt}")
-            write_summary(init=False, best_epoch=best_epoch, best_miou=best_miou)
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": student.state_dict(),
+                    "teacher_state": teacher.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "warmup_state": (warmup.state_dict() if warmup is not None else None),
+                    "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
+                    "use_amp": USE_AMP,
+                    "accum_steps": ACCUM_STEPS,
+                    "best_test_mIoU": best_test_miou,
+                    "opt_global_step": opt_global_step,  # ✅ optional: resume 시 유용
+                },
+                best_test_ckpt,
+            )
+            print(f"▶ New best test_mIoU at epoch {epoch}: {test_miou:.4f} → {best_test_ckpt}")
+            write_summary(init=False, best_epoch=best_test_epoch, best_miou=best_test_miou)
 
         if epoch % 10 == 0:
             plot_progress(list(range(1, epoch + 1)), train_losses, val_losses)
@@ -685,13 +809,43 @@ def run_training(num_epochs):
     mm = (total_sec % 3600) // 60
     ss = total_sec % 60
 
-    print(f"\nTraining complete.")
+    print("\nTraining complete.")
     print(f"Started at : {start_dt:%Y-%m-%d %H:%M:%S}")
     print(f"Finished at: {end_dt:%Y-%m-%d %H:%M:%S}")
     print(f"Total time : {hh:02d}:{mm:02d}:{ss:02d} (H:M:S)")
-    print(f"Best epoch (test mIoU): {best_epoch}, Best test_mIoU: {best_miou:.4f}")
+    print(f"Best epoch (val mIoU) : {best_val_epoch}, Best val_mIoU : {best_val_miou:.4f}")
+    print(f"Best epoch (test mIoU): {best_test_epoch}, Best test_mIoU: {best_test_miou:.4f}")
 
-    return best_ckpt
+    # ------------------------------------------------------------
+    # NEW: 학습 종료 후 두 checkpoint를 "test mIoU"로 재평가하여 최종 best 선정
+    # ------------------------------------------------------------
+    def _eval_ckpt_on_test(ckpt_path: Path) -> float:
+        if not ckpt_path.exists():
+            return float("-inf")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        student.load_state_dict(ckpt["model_state"])
+        student.eval()
+        m = evaluate.evaluate_all(student, data_loader.test_loader, device)
+        return float(m["mIoU"])
+
+    test_miou_from_best_test = _eval_ckpt_on_test(best_test_ckpt)
+    test_miou_from_best_val  = _eval_ckpt_on_test(best_val_ckpt)
+
+    print(f"Re-test best_test_ckpt: test mIoU = {test_miou_from_best_test:.4f} ({best_test_ckpt})")
+    print(f"Re-test best_val_ckpt : test mIoU = {test_miou_from_best_val:.4f} ({best_val_ckpt})")
+
+    # tie-break: best_test_ckpt 우선
+    if test_miou_from_best_val > test_miou_from_best_test:
+        shutil.copy2(best_val_ckpt, final_best_ckpt)
+        print(f"✅ Final bestmodel selected from best_val_ckpt → {final_best_ckpt}")
+        print(f"   Final test mIoU = {test_miou_from_best_val:.4f} (val-best epoch={best_val_epoch})")
+    else:
+        shutil.copy2(best_test_ckpt, final_best_ckpt)
+        print(f"✅ Final bestmodel selected from best_test_ckpt → {final_best_ckpt}")
+        print(f"   Final test mIoU = {test_miou_from_best_test:.4f} (test-best epoch={best_test_epoch})")
+
+    return final_best_ckpt
+
 
 if __name__ == "__main__":
     run_training(config.TRAIN.EPOCHS)

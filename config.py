@@ -29,14 +29,14 @@ else:
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_LR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\NEWBATCHEPOCH450_Aset_LR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "NEWBATCHEPOCH400_Aset_TransKD_noweightdecayonKD"
+    PROJECT_NAME = "NEWBATCHEPOCH450_Aset_TransKD_real_largeembeddedKDweight_logging_test"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -64,6 +64,8 @@ class DATA:
     TEST_DIR = DATA_DIR / "test"
 
     TRAIN_IMG_DIR = TRAIN_DIR / "images"
+    # Stand Alone 실험에서는 TRAIN_TEACHER_IMG_DIR = None으로 해두는게 안전함
+    #TRAIN_TEACHER_IMG_DIR = None
     TRAIN_TEACHER_IMG_DIR = TRAIN_HR_DIR / "images"  # teacher(HR) 전용 오프라인 클린 이미지
     TRAIN_LABEL_DIR = TRAIN_DIR / "labels"
     VAL_IMG_DIR = VAL_DIR / "images"
@@ -136,7 +138,7 @@ class MODEL:
 # 4. TRAIN: 훈련 과정 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class TRAIN:
-    EPOCHS = 400
+    EPOCHS = 450
     USE_WARMUP = False
     WARMUP_EPOCHS = 5
     USE_AMP = True
@@ -152,8 +154,17 @@ class TRAIN:
         "NAME": "AdamW",
         "PARAMS": {
             "lr": 6e-5,
-            "weight_decay": 1e-2
+            "weight_decay": 5e-3
         }
+    }
+    # [NEW] Param-group 분리 제어 (train_kd.py에서 사용)
+    # - lr/weight_decay는 group별로 여기서 최종 결정
+    # - AdamW의 betas/eps 등은 OPTIMIZER["PARAMS"]로 제어
+    PARAM_GROUPS = {
+        "student": {"lr": 6e-5, "weight_decay": 5e-3},
+        "kd_extra": {"lr": 3e-4, "weight_decay": 0.0},
+        # teacher는 freeze=False이고 teacher CE를 쓰는 경우에만 optimizer에 포함
+        "teacher": {"lr": 6e-5, "weight_decay": 5e-3},
     }
 
     SCHEDULER_RoP = {
@@ -168,7 +179,7 @@ class TRAIN:
 
     POLY_SCHEDULER = {
         "power": 0.9,
-        "end_learning_rate": 1e-6
+        "end_learning_rate": 1e-6,
     }
 
     LOSS_FN = {
@@ -365,7 +376,7 @@ class KD:
             "temperature": 1.0,
             "norm_type": "channel",
             "divergence": "kl",
-            "embed_weights": (0.1, 0.1, 0.5, 1.0),
+            "embed_weights": (0.2, 0.2, 1.0, 2.0),
 
             # 중요: CSF 채널 (기본은 TransKD 가정: B0->B2/B3)
             "csf_in_channels":  [32, 64, 160, 256],

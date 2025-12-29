@@ -12,13 +12,24 @@ import data_loader
 import config
 from models import create_model
 import evaluate
+from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter  # ← TensorBoard
+from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
 from torch.amp import autocast, GradScaler    # ← AMP
 
 # 보기 싫은 로그 숨김
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+# ──────────────────────────────────
+# Fair-compare switches (stand-alone baseline)
+# ──────────────────────────────────
+# KD 실험과 "학습/스케줄"만 비교하려면 입력 파이프라인이 완전히 동일해야 함.
+# 따라서 stand-alone baseline에서는 teacher 경로/JointKD 경로를 강제로 비활성화한다.
+FORCE_STANDALONE_NO_TEACHER = bool(getattr(config.TRAIN, "FORCE_STANDALONE_NO_TEACHER", True))
+ENABLE_SWT_TB_HOOK = bool(getattr(config.TRAIN, "ENABLE_SWT_TB_HOOK", False))
+ENABLE_SWT_TB_LOGGING = bool(getattr(config.TRAIN, "ENABLE_SWT_TB_LOGGING", False))
 
 # ──────────────────────────────────
 # model 설정
@@ -31,12 +42,70 @@ model.to(device)
 loss_class = getattr(nn, config.TRAIN.LOSS_FN["NAME"])
 criterion = loss_class(**config.TRAIN.LOSS_FN["PARAMS"])
 
+# ──────────────────────────────────
+# (중요) Stand-alone baseline: teacher 경로 강제 차단
+# ──────────────────────────────────
+if FORCE_STANDALONE_NO_TEACHER:
+    # data_loader가 import 시점에 이미 train_loader를 생성했을 수 있으므로,
+    # 아래는 "실수 방지"용 가드다. 실제로는 config에서 TRAIN_TEACHER_IMG_DIR=None이 최선.
+    if hasattr(config, "DATA") and hasattr(config.DATA, "TRAIN_TEACHER_IMG_DIR"):
+        try:
+            config.DATA.TRAIN_TEACHER_IMG_DIR = None
+        except Exception:
+            pass
+
+
+    # loader 배치가 ((student,teacher), mask) 형태이면 공정 비교가 깨진다.
+    # 즉시 실패시켜 문제를 조기에 드러낸다.
+    def _assert_single_tensor_batch(imgs):
+        if isinstance(imgs, (list, tuple)):
+            raise RuntimeError(
+                "Stand-alone baseline must receive a single image tensor per batch, "
+                "but got a tuple/list (likely JointKDTrainAugmentation is active). "
+                "Set config.DATA.TRAIN_TEACHER_IMG_DIR=None for this run."
+            )
+        return imgs
+
 # optimizer
 optimizer_class = getattr(optim, config.TRAIN.OPTIMIZER["NAME"])
 optimizer = optimizer_class(model.parameters(), **config.TRAIN.OPTIMIZER["PARAMS"])
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
+
+# -------------------------
+# Scheduler: Warmup(epoch) + PolyLR(iter-update)
+# -------------------------
+# Warmup scheduler (epoch-based)
+if config.TRAIN.USE_WARMUP:
+    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
+    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
+    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
+    warmup = warmup_class(optimizer, **warmup_params)
+else:
+    warmup = None
+
+# NOTE: PolyLR는 optimizer.step() 횟수(max_decay_steps) 기준으로 동작함.
+#       warmup epoch 동안은 PolyLR step을 호출하지 않음.
+iters_per_epoch = len(data_loader.train_loader)
+num_epochs = int(config.TRAIN.EPOCHS)
+warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
+effective_epochs = max(num_epochs - warmup_epochs, 1)
+
+# 총 optimizer update 횟수(=scheduler step 횟수) 계산
+total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
+
+# PolyLR 파라미터
+poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None)
+POLY_POWER = float(poly_params.get("power", 0.9) if poly_params else 0.9)
+POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6) if poly_params else 1e-6)
+
+poly_scheduler = PolynomialLRDecay(
+    optimizer,
+    max_decay_steps=total_optimizer_updates,
+    end_learning_rate=POLY_END_LR,
+    power=POLY_POWER,
+)
 
 GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
 USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
@@ -62,6 +131,8 @@ def _register_swt_hook_if_available():
     model.swt_attn.attention_net 에 forward hook을 달아서
     spatial attention map (Sigmoid 이후)을 swt_attn_cache["map"]에 저장.
     """
+    if not ENABLE_SWT_TB_HOOK:
+        return
     if not hasattr(model, "swt_attn"):
         print("▶ SWT attention module not found on model (no logging for SWT).")
         return
@@ -108,8 +179,8 @@ def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, epoch,
                     writer=None, swt_cache=None, global_step=0,
-                    accum_steps: int = 1,
-                    grad_clip_norm: float = 1.0,
+                    poly_scheduler=None, accum_steps: int = 1, do_poly_step: bool = True,
+                    grad_clip_norm: float = 1.0, opt_update_step: int = 0,
                     scaler: GradScaler | None = None, use_amp: bool = True):
     model.train()
     total_loss = 0.0
@@ -119,14 +190,9 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
     for batch_idx, (imgs, masks) in enumerate(
         tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc=f"Training {epoch}")
     ):
-        # NOTE:
-        #   JointKDTrainAugmentation 이 활성화된 경우, DataLoader는
-        #   ((student_batch, teacher_batch), mask_batch) 형태를 반환한다.
-        #   기존 코드는 imgs가 Tensor라고 가정하고 .to()를 바로 호출했기 때문에
-        #   리스트/튜플이면 AttributeError가 발생했다.
-        #   → 학생 입력만 사용하되, student 텐서를 안전하게 꺼내서 GPU로 옮긴다.
-        if isinstance(imgs, (list, tuple)):
-            imgs = imgs[0]
+        # Fair baseline: 반드시 단일 텐서 입력이어야 함.
+        if FORCE_STANDALONE_NO_TEACHER:
+            imgs = _assert_single_tensor_batch(imgs)
         imgs, masks = imgs.to(device), masks.to(device)
 
         # Forward (AMP)
@@ -159,6 +225,11 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # PolyLR step: optimizer update 때만 호출
+            if do_poly_step and (poly_scheduler is not None):
+                poly_scheduler.step(opt_update_step + 1)  # 내부 last_step 업데이트
+                opt_update_step += 1
+
         total_loss += loss.item()
 
         # ─── TensorBoard logging (per-iteration) ───
@@ -167,7 +238,8 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
             writer.add_scalar("Loss/train_iter", loss.item(), global_step)
 
             # SWT attention stats
-            if swt_cache is not None and swt_cache.get("map") is not None:
+            # 공정 비교 목적이면 기본 OFF 권장(ENABLE_SWT_TB_LOGGING=False)
+            if ENABLE_SWT_TB_LOGGING and swt_cache is not None and swt_cache.get("map") is not None:
                 attn = swt_cache["map"]  # [B,1,H,W] on CPU
                 attn_mean = attn.mean().item()
                 attn_std = attn.std().item()
@@ -197,7 +269,7 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
 
         global_step += 1
 
-    return total_loss / len(loader), global_step
+    return total_loss / len(loader), global_step, opt_update_step
 
 
 # ──────────────────────────────────
@@ -208,8 +280,8 @@ def validate(model, loader, criterion):
     total_loss = 0.0
     with torch.no_grad():
         for imgs, masks in tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Validation"):
-            if isinstance(imgs, (list, tuple)):
-                imgs = imgs[0]
+            if FORCE_STANDALONE_NO_TEACHER:
+                imgs = _assert_single_tensor_batch(imgs)
             imgs, masks = imgs.to(device), masks.to(device)
             preds = model(imgs)
             total_loss += criterion(preds, masks).item()
@@ -265,7 +337,17 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
         f.write(f"  lr           : {og['lr']}\n")
         f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        f.write("Scheduler     : None (fixed LR)\n")
+        # Scheduler summary: Warmup(epoch) + PolyLR(iter-update)
+        if warmup is not None:
+            f.write(
+                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
+                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
+            )
+        else:
+            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
+        f.write(f"  Poly max_decay_steps : {total_optimizer_updates}\n")
+        f.write(f"  Poly power           : {POLY_POWER}\n")
+        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
@@ -324,16 +406,25 @@ def run_training(num_epochs):
 
     train_losses, val_losses = [], []
     global_step = 0
+    opt_update_step = 0  # PolyLR의 step(optimizer update count)
 
     for epoch in range(1, num_epochs + 1):
         # training
-        tr_loss, global_step = train_one_epoch(
+        do_poly_step = (epoch > warmup_epochs)  # warmup 동안에는 poly step 금지
+        tr_loss, global_step, opt_update_step = train_one_epoch(
             model, data_loader.train_loader, criterion, optimizer, epoch,
             writer=writer, swt_cache=swt_attn_cache, global_step=global_step,
-            accum_steps=ACCUM_STEPS, grad_clip_norm=GRAD_CLIP_NORM,
+            poly_scheduler=poly_scheduler, accum_steps=ACCUM_STEPS,
+            do_poly_step=do_poly_step, grad_clip_norm=GRAD_CLIP_NORM,
+            opt_update_step=opt_update_step,
+            scaler=scaler, use_amp=USE_AMP,
         )
         # validation
         vl_loss = validate(model, data_loader.val_loader, criterion)
+
+        # Warmup scheduler: epoch 단위로만 step
+        if warmup is not None and epoch <= warmup_epochs:
+            warmup.step()
 
         # metric (mIoU, pixel acc, per-class IoU)
         metrics = evaluate.evaluate_all(model, data_loader.val_loader, device)
@@ -387,6 +478,10 @@ def run_training(num_epochs):
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
+                # Scheduler states: Warmup + PolyLR
+                "warmup_state": (warmup.state_dict() if warmup is not None else None),
+                "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
+                "poly_opt_update_step": opt_update_step,
                 # AMP/GA 재현을 위해 저장 (선택)
                 "use_amp": USE_AMP,
                 "accum_steps": ACCUM_STEPS,
