@@ -55,7 +55,7 @@ class CamVidDataset(Dataset):
             return (image, teacher_image), mask
         return image, mask
 
-# train set에 대한 data augmentation: random crop, random flip, random rotation, color jitter
+# train set에 대한 data augmentation: random crop, random flip, color jitter
 class TrainAugmentation:
     def __init__(
         self,
