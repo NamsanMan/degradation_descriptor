@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Dict, List
 import torchvision.utils as vutils
 from torch.utils.tensorboard import SummaryWriter
-from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
 from torch.amp import autocast, GradScaler  # ← AMP
 
 import data_loader
@@ -82,16 +81,23 @@ if config.KD.FREEZE_TEACHER:
         ckpt_path = Path(config.TEACHER_CKPT)
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-            if "model_state" in ckpt:
-                teacher.load_state_dict(ckpt["model_state"])
-                print(f"▶ Successfully loaded pretrained teacher weights from: {ckpt_path}")
-            else:
-                teacher.load_state_dict(ckpt)
-                print(f"▶ Successfully loaded pretrained teacher weights from: {ckpt_path} (direct state dict)")
+
+            # --- STRICT teacher checkpoint validation ---
+            sd = ckpt["model_state"] if isinstance(ckpt, dict) and "model_state" in ckpt else ckpt
+
+            # DataParallel 호환 (module. prefix 제거)
+            if any(k.startswith("module.") for k in sd.keys()):
+                sd = {k.replace("module.", "", 1): v for k, v in sd.items()}
+
+            ret = teacher.load_state_dict(sd, strict=True)
+            print(
+                f"▶ Teacher checkpoint loaded OK (strict=True): {ckpt_path} "
+                f"| incompatible_keys={ret}"
+            )
         else:
             print(f"⚠️ WARNING: Teacher checkpoint not found at {ckpt_path}. Using ImageNet pretrained weights.")
     except Exception as e:
-        print(f"⚠️ WARNING: Failed to load teacher checkpoint. Error: {e}. Using ImageNet pretrained weights.")
+        raise RuntimeError(f"❌ Teacher checkpoint load FAILED (strict=True): {ckpt_path}\n{e}")
 
     # Freeze the teacher so only the student updates during KD.
     for p in teacher.parameters():
@@ -181,9 +187,6 @@ if len(teacher_params) > 0:
 
 optimizer = optimizer_class(param_groups, **base_opt_params)
 
-# -------------------------
-# Scheduler: Warmup(epoch) + PolyLR(iter-update)
-# -------------------------
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
@@ -193,36 +196,7 @@ USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
 AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
 scaler = GradScaler(enabled=bool(USE_AMP and AMP_DEVICE_TYPE == "cuda"))
 
-# warm-up (epoch 단위)
-if config.TRAIN.USE_WARMUP:
-    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
-    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
-    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
-    warmup = warmup_class(optimizer, **warmup_params)
-else:
-    warmup = None
-
-iters_per_epoch = len(data_loader.train_loader)
-num_epochs = int(config.TRAIN.EPOCHS)
-warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
-effective_epochs = max(num_epochs - warmup_epochs, 1)
-total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
-
-poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None) or {}
-# [NEW] PolyLR 관련 하이퍼파라미터를 config에서 완전 제어
-# - power, end_learning_rate는 기존과 동일 키 지원
-# - max_decay_steps는 기본(total_optimizer_updates)이나, config에서 override 가능
-POLY_POWER = float(poly_params.get("power", 0.9))
-POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6))
-POLY_MAX_DECAY_STEPS = int(poly_params.get("max_decay_steps", total_optimizer_updates))
-
-poly_scheduler = PolynomialLRDecay(
-    optimizer,
-    max_decay_steps=POLY_MAX_DECAY_STEPS,
-    end_learning_rate=POLY_END_LR,
-    power=POLY_POWER,
-)
-
+warmup = None
 
 def _mask_to_grid(mask_tensor: torch.Tensor, num_classes: int) -> torch.Tensor:
     """Convert integer masks (B,H,W) to a grid for TensorBoard logging."""
@@ -293,7 +267,6 @@ def train_one_epoch_kd(
     writer=None,
     epoch: int = 0,
     global_step_start: int = 0,
-    opt_global_step_start: int = 0,  # ✅ GLOBAL optimizer-update counter start (monotonic across epochs)
 ):
     kd_engine.train()
     if hasattr(kd_engine, "set_epoch"):
@@ -309,9 +282,6 @@ def train_one_epoch_kd(
 
     pbar = tqdm(loader, ascii=True, dynamic_ncols=True, leave=True, desc="Training")
     optimizer.zero_grad(set_to_none=True)
-
-    # ✅ GLOBAL (across epochs) optimizer update step for PolyLR
-    opt_update_step = int(opt_global_step_start)
 
     for batch_idx, (imgs, masks) in enumerate(pbar):
         imgs = _move_to_device(imgs, device)
@@ -349,16 +319,6 @@ def train_one_epoch_kd(
                 optimizer.step()
 
             optimizer.zero_grad(set_to_none=True)
-
-            # ✅ PolyLR: warmup epoch 동안에는 step 금지
-            # IMPORTANT: step number must be GLOBAL (monotonic) across whole training.
-            if (epoch > warmup_epochs) and (poly_scheduler is not None):
-                poly_scheduler.step(opt_update_step + 1)
-                opt_update_step += 1
-
-            # ✅ (optional) per-update LR logging (more accurate than epoch logging)
-            if writer is not None:
-                writer.add_scalar("lr_step", optimizer.param_groups[0]["lr"], opt_update_step)
 
         # 누적 loss (epoch 평균용)
         for key in epoch_losses:
@@ -543,7 +503,7 @@ def train_one_epoch_kd(
 
     num_batches = len(loader)
     avg_losses = {key: val / num_batches for key, val in epoch_losses.items()}
-    return avg_losses, opt_update_step  # ✅ return updated GLOBAL optimizer-update step
+    return avg_losses
 
 
 # ── (변경) 검증(학생 기준) ─────────────────────────────────
@@ -582,16 +542,6 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write("  --- Param Groups ---\n")
         for gi, g in enumerate(optimizer.param_groups):
             f.write(f"  group[{gi}] lr={g.get('lr')} wd={g.get('weight_decay')} n_params={len(g.get('params', []))}\n")
-        if warmup is not None:
-            f.write(
-                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
-                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
-            )
-        else:
-            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
-        f.write(f"  Poly max_decay_steps : {POLY_MAX_DECAY_STEPS}\n")
-        f.write(f"  Poly power           : {POLY_POWER}\n")
-        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
@@ -672,10 +622,9 @@ def run_training(num_epochs):
     criterion = loss_class(**config.TRAIN.LOSS_FN["PARAMS"])
 
     global_step = 0
-    opt_global_step = 0  # ✅ GLOBAL optimizer update step (PolyLR 기준, epoch 넘어도 누적)
 
     for epoch in range(1, num_epochs + 1):
-        tr_losses_dict, opt_global_step = train_one_epoch_kd(
+        tr_losses_dict = train_one_epoch_kd(
             kd_engine,
             data_loader.train_loader,
             optimizer,
@@ -683,7 +632,6 @@ def run_training(num_epochs):
             writer=writer,
             epoch=epoch,
             global_step_start=global_step,
-            opt_global_step_start=opt_global_step,
         )
         tr_loss = tr_losses_dict["total"]
         global_step += len(data_loader.train_loader)
@@ -705,12 +653,9 @@ def run_training(num_epochs):
                     "model_state": student.state_dict(),
                     "teacher_state": teacher.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
-                    "warmup_state": (warmup.state_dict() if warmup is not None else None),
-                    "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
                     "use_amp": USE_AMP,
                     "accum_steps": ACCUM_STEPS,
                     "best_val_mIoU": best_val_miou,
-                    "opt_global_step": opt_global_step,
                 },
                 best_val_ckpt,
             )
@@ -722,10 +667,6 @@ def run_training(num_epochs):
             test_metrics = evaluate.evaluate_all(model, data_loader.test_loader, device)
             test_miou = test_metrics["mIoU"]
             test_pa = test_metrics["PixelAcc"]
-
-        # Warmup: epoch 단위로만 step
-        if warmup is not None and epoch <= warmup_epochs:
-            warmup.step()
 
         train_losses.append(tr_loss)
         val_losses.append(vl_loss)
@@ -783,12 +724,9 @@ def run_training(num_epochs):
                     "model_state": student.state_dict(),
                     "teacher_state": teacher.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
-                    "warmup_state": (warmup.state_dict() if warmup is not None else None),
-                    "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
                     "use_amp": USE_AMP,
                     "accum_steps": ACCUM_STEPS,
                     "best_test_mIoU": best_test_miou,
-                    "opt_global_step": opt_global_step,  # ✅ optional: resume 시 유용
                 },
                 best_test_ckpt,
             )

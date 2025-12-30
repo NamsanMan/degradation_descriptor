@@ -15,7 +15,6 @@ import evaluate
 from pathlib import Path
 
 from torch.utils.tensorboard import SummaryWriter  # ← TensorBoard
-from torch_poly_lr_decay import PolynomialLRDecay  # ← PolyLR (cmpark0126)
 from torch.amp import autocast, GradScaler    # ← AMP
 
 # 보기 싫은 로그 숨김
@@ -72,40 +71,6 @@ optimizer = optimizer_class(model.parameters(), **config.TRAIN.OPTIMIZER["PARAMS
 ACCUM_STEPS = int(getattr(config.TRAIN, "ACCUM_STEPS", 1))
 if ACCUM_STEPS < 1:
     raise ValueError(f"ACCUM_STEPS must be >= 1, got {ACCUM_STEPS}")
-
-# -------------------------
-# Scheduler: Warmup(epoch) + PolyLR(iter-update)
-# -------------------------
-# Warmup scheduler (epoch-based)
-if config.TRAIN.USE_WARMUP:
-    warmup_class = getattr(optim.lr_scheduler, config.TRAIN.WARMUP_SCHEDULER["NAME"])
-    warmup_params = config.TRAIN.WARMUP_SCHEDULER["PARAMS"].copy()
-    warmup_params["total_iters"] = config.TRAIN.WARMUP_EPOCHS
-    warmup = warmup_class(optimizer, **warmup_params)
-else:
-    warmup = None
-
-# NOTE: PolyLR는 optimizer.step() 횟수(max_decay_steps) 기준으로 동작함.
-#       warmup epoch 동안은 PolyLR step을 호출하지 않음.
-iters_per_epoch = len(data_loader.train_loader)
-num_epochs = int(config.TRAIN.EPOCHS)
-warmup_epochs = int(config.TRAIN.WARMUP_EPOCHS) if config.TRAIN.USE_WARMUP else 0
-effective_epochs = max(num_epochs - warmup_epochs, 1)
-
-# 총 optimizer update 횟수(=scheduler step 횟수) 계산
-total_optimizer_updates = (effective_epochs * iters_per_epoch + ACCUM_STEPS - 1) // ACCUM_STEPS
-
-# PolyLR 파라미터
-poly_params = getattr(config.TRAIN, "POLY_SCHEDULER", None)
-POLY_POWER = float(poly_params.get("power", 0.9) if poly_params else 0.9)
-POLY_END_LR = float(poly_params.get("end_learning_rate", 1e-6) if poly_params else 1e-6)
-
-poly_scheduler = PolynomialLRDecay(
-    optimizer,
-    max_decay_steps=total_optimizer_updates,
-    end_learning_rate=POLY_END_LR,
-    power=POLY_POWER,
-)
 
 GRAD_CLIP_NORM = float(getattr(config.TRAIN, "GRAD_CLIP_NORM", 1.0))
 USE_AMP = bool(getattr(config.TRAIN, "USE_AMP", True))
@@ -179,8 +144,8 @@ def denorm_imagenet(x: torch.Tensor) -> torch.Tensor:
 # ──────────────────────────────────
 def train_one_epoch(model, loader, criterion, optimizer, epoch,
                     writer=None, swt_cache=None, global_step=0,
-                    poly_scheduler=None, accum_steps: int = 1, do_poly_step: bool = True,
-                    grad_clip_norm: float = 1.0, opt_update_step: int = 0,
+                    accum_steps: int = 1,
+                    grad_clip_norm: float = 1.0,
                     scaler: GradScaler | None = None, use_amp: bool = True):
     model.train()
     total_loss = 0.0
@@ -225,11 +190,6 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
                 optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-            # PolyLR step: optimizer update 때만 호출
-            if do_poly_step and (poly_scheduler is not None):
-                poly_scheduler.step(opt_update_step + 1)  # 내부 last_step 업데이트
-                opt_update_step += 1
-
         total_loss += loss.item()
 
         # ─── TensorBoard logging (per-iteration) ───
@@ -269,7 +229,7 @@ def train_one_epoch(model, loader, criterion, optimizer, epoch,
 
         global_step += 1
 
-    return total_loss / len(loader), global_step, opt_update_step
+    return total_loss / len(loader), global_step
 
 
 # ──────────────────────────────────
@@ -302,27 +262,6 @@ def plot_progress(epochs, train_losses, val_losses):
     plt.savefig(str(config.GENERAL.SAVE_PLOT), bbox_inches="tight")
     plt.close()
 
-
-# NEW: PDM 설정 덤프 헬퍼
-def _dump_pdm_config(f):
-    f.write("=== PDM (Patchwise Degradation Mix) ===\n")
-    if not hasattr(config, "PDM"):
-        f.write("PDM: not configured\n\n")
-        return
-    P = config.PDM
-    f.write(f"ENABLE         : {getattr(P, 'ENABLE', False)}\n")
-    f.write(f"APPLY_PROB     : {getattr(P, 'APPLY_PROB', 0.0)}\n")
-    f.write(f"PATCH_SIZE     : {getattr(P, 'PATCH_SIZE', None)}\n")
-    f.write(f"REPLACE_RATIO  : {getattr(P, 'REPLACE_RATIO', None)}\n")
-    f.write(f"DOWNSCALE_MIN  : {getattr(P, 'DOWNSCALE_MIN', None)}\n")
-    f.write(f"DOWNSCALE_MAX  : {getattr(P, 'DOWNSCALE_MAX', None)}\n")
-    f.write(f"GAUSS_MU       : {getattr(P, 'GAUSS_MU', None)}\n")
-    f.write(f"GAUSS_SIGMA_RANGE : {getattr(P, 'GAUSS_SIGMA_RANGE', None)}\n")
-    f.write(f"GRAY_NOISE_PROB: {getattr(P, 'GRAY_NOISE_PROB', None)}\n")
-    f.write(f"DOWNSCALE_INTERP: {getattr(P, 'DOWNSCALE_INTERP', None)}\n")
-    f.write(f"UPSCALE_INTERP  : {getattr(P, 'UPSCALE_INTERP', None)}\n\n")
-
-
 def write_summary(init=False, best_epoch=None, best_miou=None):
     """
     init=True: config만 기록
@@ -337,23 +276,9 @@ def write_summary(init=False, best_epoch=None, best_miou=None):
         f.write(f"Optimizer     : {optimizer.__class__.__name__}\n")
         f.write(f"  lr           : {og['lr']}\n")
         f.write(f"  weight_decay : {og.get('weight_decay')}\n")
-        # Scheduler summary: Warmup(epoch) + PolyLR(iter-update)
-        if warmup is not None:
-            f.write(
-                f"Scheduler     : Warmup({warmup.__class__.__name__}, epochs={warmup_epochs}) "
-                f"+ PolyLR({poly_scheduler.__class__.__name__})\n"
-            )
-        else:
-            f.write(f"Scheduler     : PolyLR({poly_scheduler.__class__.__name__})\n")
-        f.write(f"  Poly max_decay_steps : {total_optimizer_updates}\n")
-        f.write(f"  Poly power           : {POLY_POWER}\n")
-        f.write(f"  Poly end_lr          : {POLY_END_LR}\n")
         f.write(f"AMP           : {USE_AMP} (device_type={AMP_DEVICE_TYPE})\n")
         f.write(f"Accum steps   : {ACCUM_STEPS}\n")
         f.write(f"Batch size    : {config.DATA.BATCH_SIZE}\n\n")
-
-        # NEW: PDM 설정 요약 기록
-        _dump_pdm_config(f)
 
         if init:
             f.write("=== Best Model (to be updated) ===\n")
@@ -388,7 +313,13 @@ def run_training(num_epochs):
 
     best_miou = 0.0
     best_epoch = 0
-    best_ckpt = config.GENERAL.BASE_DIR / "best_model.pth"
+    best_ckpt_vmIoU = config.GENERAL.BASE_DIR / "best_model_vmIoU.pth"
+    final_best_ckpt = config.GENERAL.BASE_DIR / "best_model.pth"
+
+    # (추가) val loss 기준 best ckpt
+    best_vloss = float("inf")
+    best_vloss_epoch = 0
+    best_vloss_ckpt = config.GENERAL.BASE_DIR / "best_model_vloss.pth"
 
     # CSV 로그 파일 경로 설정 및 헤더 생성
     log_csv_path = config.GENERAL.LOG_DIR / "training_log.csv"
@@ -406,25 +337,17 @@ def run_training(num_epochs):
 
     train_losses, val_losses = [], []
     global_step = 0
-    opt_update_step = 0  # PolyLR의 step(optimizer update count)
 
     for epoch in range(1, num_epochs + 1):
         # training
-        do_poly_step = (epoch > warmup_epochs)  # warmup 동안에는 poly step 금지
-        tr_loss, global_step, opt_update_step = train_one_epoch(
+        tr_loss, global_step = train_one_epoch(
             model, data_loader.train_loader, criterion, optimizer, epoch,
             writer=writer, swt_cache=swt_attn_cache, global_step=global_step,
-            poly_scheduler=poly_scheduler, accum_steps=ACCUM_STEPS,
-            do_poly_step=do_poly_step, grad_clip_norm=GRAD_CLIP_NORM,
-            opt_update_step=opt_update_step,
+            accum_steps=ACCUM_STEPS, grad_clip_norm=GRAD_CLIP_NORM,
             scaler=scaler, use_amp=USE_AMP,
         )
         # validation
         vl_loss = validate(model, data_loader.val_loader, criterion)
-
-        # Warmup scheduler: epoch 단위로만 step
-        if warmup is not None and epoch <= warmup_epochs:
-            warmup.step()
 
         # metric (mIoU, pixel acc, per-class IoU)
         metrics = evaluate.evaluate_all(model, data_loader.val_loader, device)
@@ -456,7 +379,7 @@ def run_training(num_epochs):
         # CSV 파일에 성능 지표 기록
         log_data = {
             "Epoch": epoch,
-            "TRAIN Loss": tr_loss,
+            "Train Loss": tr_loss,
             "VAL Loss": vl_loss,
             "Val mIoU": miou,
             "Pixel Acc": pa,
@@ -478,17 +401,26 @@ def run_training(num_epochs):
                 "epoch": epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
-                # Scheduler states: Warmup + PolyLR
-                "warmup_state": (warmup.state_dict() if warmup is not None else None),
-                "poly_state": (poly_scheduler.state_dict() if poly_scheduler is not None else None),
-                "poly_opt_update_step": opt_update_step,
                 # AMP/GA 재현을 위해 저장 (선택)
                 "use_amp": USE_AMP,
                 "accum_steps": ACCUM_STEPS,
                 "best_val_mIoU": best_miou
-            }, best_ckpt)
-            print(f"▶ New best val_mIoU at epoch {epoch}: {miou:.4f} → {best_ckpt}")
+            }, best_ckpt_vmIoU)
+            print(f"▶ New best val_mIoU at epoch {epoch}: {miou:.4f} → {best_ckpt_vmIoU}")
             write_summary(init=False, best_epoch=best_epoch, best_miou=best_miou)
+        # (추가) val loss 기준 best ckpt 갱신
+        if vl_loss < best_vloss:
+            best_vloss = vl_loss
+            best_vloss_epoch = epoch
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "use_amp": USE_AMP,
+                "accum_steps": ACCUM_STEPS,
+                "best_val_loss": best_vloss
+            }, best_vloss_ckpt)
+            print(f"▶ New best val_loss at epoch {epoch}: {vl_loss:.4f} → {best_vloss_ckpt}")
 
         # 10 epoch마다 loss curve plot 저장
         if epoch % 10 == 0:
@@ -507,9 +439,49 @@ def run_training(num_epochs):
 
     write_timing(start_dt, end_dt, config.GENERAL.SUMMARY_TXT)
 
-    print(f"Training complete. Best epoch: {best_epoch}, Best val_mIoU: {best_miou:.4f}")
-    return best_ckpt
+    # ──────────────────────────────────
+    # (추가) 최종 test: val mIoU best vs val loss best 둘 다 측정 후,
+    # test mIoU가 더 큰 쪽을 최종 best로 선정
+    # ──────────────────────────────────
+    def _eval_ckpt_on_loader(ckpt_path: Path, loader):
+        ckpt = torch.load(ckpt_path, map_location=device)
+        sd = ckpt["model_state"] if "model_state" in ckpt else ckpt
+        model.load_state_dict(sd, strict=True)
+        metrics = evaluate.evaluate_all(model, loader, device)
+        return float(metrics["mIoU"]), metrics
 
+    if not hasattr(data_loader, "test_loader"):
+        print("⚠ data_loader.test_loader 가 없어 test 평가를 건너뜁니다. (best_model.pth 저장 안 함)")
+        print(f"Training complete. Best val_mIoU epoch: {best_epoch}, Best val_mIoU: {best_miou:.4f}")
+        return best_ckpt_vmIoU
+
+    test_miou_m, _ = _eval_ckpt_on_loader(best_ckpt_vmIoU, data_loader.test_loader)
+    test_miou_l, _ = _eval_ckpt_on_loader(best_vloss_ckpt, data_loader.test_loader)
+
+    if test_miou_l > test_miou_m:
+        chosen = best_vloss_ckpt
+        chosen_tag = "best_val_loss"
+        chosen_test_miou = test_miou_l
+    else:
+        chosen = best_ckpt_vmIoU
+        chosen_tag = "best_val_mIoU"
+        chosen_test_miou = test_miou_m
+
+    # 두 ckpt의 test mIoU 출력 후, 더 높은 쪽을 best_model.pth로 최종 저장
+    print(f"Test mIoU (from best_model_vmIoU.pth): {test_miou_m:.4f}")
+    print(f"Test mIoU (from best_model_vloss.pth): {test_miou_l:.4f}")
+
+    chosen_ckpt_obj = torch.load(chosen, map_location="cpu")
+    if isinstance(chosen_ckpt_obj, dict):
+        chosen_ckpt_obj["final_selection"] = chosen_tag
+        chosen_ckpt_obj["test_mIoU"] = chosen_test_miou
+    torch.save(chosen_ckpt_obj, final_best_ckpt)
+
+    print(f"Training complete.")
+    print(f"  - Best val_mIoU ckpt : {best_ckpt_vmIoU} (test mIoU={test_miou_m:.4f})")
+    print(f"  - Best val_loss ckpt : {best_vloss_ckpt} (test mIoU={test_miou_l:.4f})")
+    print(f"  - Final best (by test mIoU): {final_best_ckpt} ({chosen_tag}, test mIoU={chosen_test_miou:.4f})")
+    return final_best_ckpt
 
 if __name__ == "__main__":
     ckpt_path = run_training(config.TRAIN.EPOCHS)
