@@ -63,8 +63,6 @@ class TrainAugmentation:
         hflip_prob: float = 0.5,
         crop_prob: float = 0.7,
         crop_range: tuple[float, float] = (80.0, 100.0),
-        rotation_prob: float = 0.2,
-        rotation_degree: float = 5.0,
         brightness: tuple[float, float] = (0.6, 1.4),
         contrast: tuple[float, float]   = (0.7, 1.2),
         saturation: tuple[float, float] = (0.9, 1.3),
@@ -75,9 +73,6 @@ class TrainAugmentation:
 
         self.crop_prob = crop_prob
         self.crop_min, self.crop_max = crop_range
-
-        self.rotation_prob = rotation_prob
-        self.rotation_degree = rotation_degree
 
         self.brightness = brightness
         self.contrast   = contrast
@@ -107,12 +102,6 @@ class TrainAugmentation:
         if random.random() < self.hflip_prob:
             img  = F.hflip(img)
             mask = F.hflip(mask)
-
-        # 3) 랜덤 회전 (20% 확률, -5도~+5도)
-        if random.random() < self.rotation_prob:
-            angle = random.uniform(-self.rotation_degree, self.rotation_degree)
-            img  = F.rotate(img, angle, interpolation=InterpolationMode.BILINEAR,expand=False)
-            mask = F.rotate(mask, angle, interpolation=InterpolationMode.NEAREST, expand=False, fill=config.DATA.IGNORE_INDEX)    #fill에는 빈공간을 void label로 매꾸게 설정(class 11 = void)
 
         # 4) 컬러 지터
         b = random.uniform(*self.brightness)
@@ -160,8 +149,6 @@ class JointKDTrainAugmentation:
         hflip_prob: float = 0.5,
         crop_prob: float = 0.7,
         crop_range: tuple[float, float] = (80.0, 100.0),
-        rotation_prob: float = 0.2,
-        rotation_degree: float = 5.0,
         brightness: tuple[float, float] = (0.6, 1.4),
         contrast: tuple[float, float]   = (0.7, 1.2),
         saturation: tuple[float, float] = (0.9, 1.3),
@@ -171,8 +158,6 @@ class JointKDTrainAugmentation:
         self.hflip_prob = hflip_prob
         self.crop_prob = crop_prob
         self.crop_min, self.crop_max = crop_range
-        self.rotation_prob = rotation_prob
-        self.rotation_degree = rotation_degree
         self.brightness = brightness
         self.contrast   = contrast
         self.saturation = saturation
@@ -230,24 +215,6 @@ class JointKDTrainAugmentation:
             img_student = F.hflip(img_student)
             img_teacher = F.hflip(img_teacher)
             mask = F.hflip(mask)
-
-        # 랜덤 회전
-        if random.random() < self.rotation_prob:
-            angle = random.uniform(-self.rotation_degree, self.rotation_degree)
-            # TrainAugmentation과 동치: expand=False, mask fill=IGNORE_INDEX
-            img_student = F.rotate(
-                img_student, angle, interpolation=InterpolationMode.BILINEAR, expand=False
-            )
-            img_teacher = F.rotate(
-                img_teacher, angle, interpolation=InterpolationMode.BILINEAR, expand=False
-            )
-            mask = F.rotate(
-                mask,
-                angle,
-                interpolation=InterpolationMode.NEAREST,
-                expand=False,
-                fill=config.DATA.IGNORE_INDEX,
-            )
 
         # 공통 photometric jitter: student/teacher 동일 분포 강제
         img_student, img_teacher = self._apply_same_color_jitter(img_student, img_teacher)
