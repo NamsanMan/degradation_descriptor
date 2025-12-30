@@ -444,7 +444,7 @@ def run_training(num_epochs):
     # test mIoU가 더 큰 쪽을 최종 best로 선정
     # ──────────────────────────────────
     def _eval_ckpt_on_loader(ckpt_path: Path, loader):
-        ckpt = torch.load(ckpt_path, map_location=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         sd = ckpt["model_state"] if "model_state" in ckpt else ckpt
         model.load_state_dict(sd, strict=True)
         metrics = evaluate.evaluate_all(model, loader, device)
