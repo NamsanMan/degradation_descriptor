@@ -471,7 +471,7 @@ def run_training(num_epochs):
     print(f"Test mIoU (from best_model_vmIoU.pth): {test_miou_m:.4f}")
     print(f"Test mIoU (from best_model_vloss.pth): {test_miou_l:.4f}")
 
-    chosen_ckpt_obj = torch.load(chosen, map_location="cpu")
+    chosen_ckpt_obj = torch.load(chosen, map_location="cpu", weights_only=False)
     if isinstance(chosen_ckpt_obj, dict):
         chosen_ckpt_obj["final_selection"] = chosen_tag
         chosen_ckpt_obj["test_mIoU"] = chosen_test_miou
