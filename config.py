@@ -24,19 +24,19 @@ else:
     print("▶ Running in local environment.")
 
     # 기존에 사용하시던 로컬 경로 설정
-    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
+    DATA_HR_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_v4\A_set")
     DATA_DIR = Path(r"D:\LAB\datasets\project_use\CamVid_12_2Fold_LR_x4_Bilinear\A_set")
     BASE_DIR = Path(r"D:\LAB\result_files\test_results")
 
     # KD용 weight load
-    TEACHER_CKPT = r'D:\LAB\result_files\test_results\NEWBATCHEPOCH450_Aset_LR_segb3\best_model.pth'
+    TEACHER_CKPT = r'D:\LAB\result_files\test_results\Aset_HR_segb3\best_model.pth'
 
 # ──────────────────────────────────────────────────────────────────
 # 1. GENERAL: 프로젝트 전반 및 실험 관리 설정
 # ──────────────────────────────────────────────────────────────────
 class GENERAL:
     # 실험 프로젝트 이름
-    PROJECT_NAME = "NEWBATCHEPOCH450_Aset_TransKD_real_largeembeddedKDweight_logging_test"
+    PROJECT_NAME = "FIX_Aset_TransKdBase_HR2LR"
 
     # 결과 파일을 저장할 기본 경로
     BASE_DIR = BASE_DIR / PROJECT_NAME
@@ -138,9 +138,7 @@ class MODEL:
 # 4. TRAIN: 훈련 과정 관련 설정
 # ──────────────────────────────────────────────────────────────────
 class TRAIN:
-    EPOCHS = 450
-    USE_WARMUP = False
-    WARMUP_EPOCHS = 5
+    EPOCHS = 300
     USE_AMP = True
     ACCUM_STEPS = 1
     GRAD_CLIP_NORM = 1.0
@@ -177,27 +175,12 @@ class TRAIN:
         }
     }
 
-    POLY_SCHEDULER = {
-        "power": 0.9,
-        "end_learning_rate": 1e-6,
-    }
-
     LOSS_FN = {
         "NAME": "CrossEntropyLoss",
         "PARAMS": {
             "ignore_index": DATA.IGNORE_INDEX
         }
     }
-
-    # Warmup도 동일한 구조로 추가
-    WARMUP_SCHEDULER = {
-        "NAME": "LinearLR",
-        "PARAMS": {
-            "start_factor": 0.1,
-            "end_factor": 1.0,
-        }
-    }
-
 
 # ──────────────────────────────────────────────────────────────────
 # 5. KD: Knowledge Distillation 관련 설정
@@ -376,7 +359,7 @@ class KD:
             "temperature": 1.0,
             "norm_type": "channel",
             "divergence": "kl",
-            "embed_weights": (0.2, 0.2, 1.0, 2.0),
+            "embed_weights": (0.1, 0.1, 0.5, 1.0),
 
             # 중요: CSF 채널 (기본은 TransKD 가정: B0->B2/B3)
             "csf_in_channels":  [32, 64, 160, 256],
